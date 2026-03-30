@@ -6,3 +6,4 @@ build-*/
 reference/
 docs/release_notes/
 build.ps1
+.DS_Store
