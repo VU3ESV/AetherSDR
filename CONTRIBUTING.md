@@ -125,6 +125,7 @@ src/
     ├── EqApplet          — 8-band graphic equalizer
     ├── SMeterWidget      — Analog S-meter gauge
     ├── RadioSetupDialog  — 8-tab settings dialog
+    ├── SpotHubDialog     — Unified spot manager (DX Cluster, RBN, WSJT-X, POTA, Spot List, Display)
     └── HGauge.h          — Reusable horizontal gauge (header-only)
 ```
 
@@ -235,6 +236,50 @@ widgets for consistency.
 - First line under 72 characters.
 - Reference issues: `Fixes #42` or `Closes #42`.
 - Blank line then longer description if needed.
+
+### Commit Signing
+
+All commits to `main` must be GPG-signed. Unsigned commits will be rejected
+by branch protection. Each contributor uses their own personal GPG key — do
+NOT use the project release signing key for commits.
+
+#### Quick Setup
+
+1. **Generate a GPG key** (if you don't already have one):
+   ```bash
+   gpg --quick-gen-key "Your Name <your-email@example.com>" ed25519 sign 0
+   ```
+
+2. **Add the key to your GitHub account:**
+   ```bash
+   # Copy your public key
+   gpg --armor --export <KEY_ID>
+   ```
+   Paste the output at [GitHub → Settings → SSH and GPG keys → New GPG key](https://github.com/settings/gpg/new).
+
+3. **Configure git to sign commits:**
+   ```bash
+   git config --global user.signingkey <KEY_ID>
+   git config --global commit.gpgsign true
+   ```
+
+4. **Verify it works:**
+   ```bash
+   git commit --allow-empty -m "Test signed commit"
+   git log --show-signature -1
+   ```
+
+Your commits will show a green "Verified" badge on GitHub.
+
+#### Troubleshooting
+
+If `gpg` prompts for a passphrase but hangs in a terminal, set the GPG TTY:
+
+```bash
+echo 'export GPG_TTY=$(tty)' >> ~/.bashrc   # or ~/.zshrc
+```
+
+For GUI-based passphrase entry, install `pinentry-gnome3` or `pinentry-qt`.
 
 ---
 
@@ -452,6 +497,7 @@ technical and focused — treat it like a code review conversation.
 | Parse a new status object | `RadioModel::onStatusReceived()` — add routing for the object name |
 | Add a new meter display | `MeterModel` already parses all meters — wire to a gauge widget |
 | Add a new Radio Setup tab | `RadioSetupDialog.cpp` — follow existing tab patterns |
+| Add a new spot source | `SpotHubDialog.cpp` — follow DX Cluster/RBN/WSJT-X/POTA tab patterns |
 | Fix a protocol command | Check `reference/FlexLib/` for correct syntax, test with radio logs |
 
 ---

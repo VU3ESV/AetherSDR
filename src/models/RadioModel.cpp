@@ -4,6 +4,9 @@
 #include "core/LogManager.h"
 #include <QDebug>
 #include <QRegularExpression>
+#include <QDateTime>
+#include <QtEndian>
+#include <cmath>
 #include "core/AppSettings.h"
 
 namespace AetherSDR {
@@ -33,8 +36,46 @@ RadioModel::RadioModel(QObject* parent)
         sendCmd(cmd);
     });
 
+    // Forward DAX IQ commands to the radio
+    connect(&m_daxIqModel, &DaxIqModel::commandReady, this, [this](const QString& cmd){
+        sendCmd(cmd);
+    });
+
     // Forward transmit model commands to the radio
     connect(&m_transmitModel, &TransmitModel::commandReady, this, [this](const QString& cmd){
+        // Keep txRequested in sync even when command comes directly from
+        // TransmitModel (e.g. TxApplet MOX button).
+        static const QRegularExpression xmitRe(R"(^xmit\s+([01])\s*$)", QRegularExpression::CaseInsensitiveOption);
+        const auto match = xmitRe.match(cmd.trimmed());
+        if (match.hasMatch()) {
+            const bool tx = (match.captured(1) == "1");
+            m_txRequested = tx;
+            if (!tx && m_txAudioGate) {
+                m_txAudioGate = false;
+                emit txAudioGateChanged(false);
+            }
+        }
+
+        // Intercept TUNE start: inhibit ACC TX first to protect amplifier
+        if (cmd == "transmit tune 1"
+            && AppSettings::instance().value("TuneInhibitAmp", "False").toString() == "True") {
+            // Find TX slice frequency
+            double txFreq = 0.0;
+            for (auto* s : m_slices) {
+                if (s->isTxSlice()) { txFreq = s->frequency(); break; }
+            }
+            int bandId = bandIdForFrequency(txFreq);
+            if (bandId >= 0) {
+                auto it = m_txBandSettings.find(bandId);
+                if (it != m_txBandSettings.end() && it->accTx) {
+                    m_tuneInhibitBandId = bandId;
+                    m_tuneInhibitActive = true;
+                    sendCmd(QString("interlock bandset %1 acc_tx_enabled=0").arg(bandId));
+                    qDebug() << "Tune PA inhibit: disabled ACC TX on band" << bandId
+                             << "before tune";
+                }
+            }
+        }
         sendCmd(cmd);
     });
 
@@ -47,15 +88,47 @@ RadioModel::RadioModel(QObject* parent)
     connect(&m_tnfModel, &TnfModel::commandReady, this, [this](const QString& cmd){
         sendCmd(cmd);
     });
+    connect(&m_cwxModel, &CwxModel::commandReady, this, [this](const QString& cmd){
+        sendCmd(cmd);
+    });
+    connect(&m_dvkModel, &DvkModel::commandReady, this, [this](const QString& cmd){
+        sendCmd(cmd);
+    });
+    connect(&m_usbCableModel, &UsbCableModel::commandReady, this, [this](const QString& cmd){
+        sendCmd(cmd);
+    });
 
-    m_reconnectTimer.setSingleShot(true);
-    m_reconnectTimer.setInterval(3000);
+    // ── Tune PA inhibit: restore ACC TX when tune completes ──
+    connect(&m_transmitModel, &TransmitModel::tuneChanged, this, [this](bool tuning) {
+        if (!tuning && m_tuneInhibitActive && m_tuneInhibitBandId >= 0) {
+            sendCmd(QString("interlock bandset %1 acc_tx_enabled=1").arg(m_tuneInhibitBandId));
+            qDebug() << "Tune PA inhibit: restored ACC TX on band" << m_tuneInhibitBandId;
+            m_tuneInhibitActive = false;
+            m_tuneInhibitBandId = -1;
+        }
+    });
+
+    m_reconnectTimer.setInterval(5000);
     connect(&m_reconnectTimer, &QTimer::timeout, this, [this]() {
         if (!m_intentionalDisconnect && !m_lastInfo.address.isNull()) {
             qCDebug(lcProtocol) << "RadioModel: auto-reconnecting to" << m_lastInfo.address.toString();
             m_connection.connectToRadio(m_lastInfo);
+        } else {
+            m_reconnectTimer.stop();
         }
     });
+
+}
+
+RadioModel::~RadioModel()
+{
+    // Disconnect all signals from m_connection to this BEFORE member
+    // destruction. Otherwise ~RadioConnection calls disconnectFromHost()
+    // which emits disconnected(), firing slots that access already-destroyed
+    // members (XVTR map, slice models, etc.) — use-after-free under ASAN.
+    QObject::disconnect(&m_connection, nullptr, this, nullptr);
+    QObject::disconnect(&m_panStream, nullptr, this, nullptr);
+    m_connection.disconnectFromRadio();
 }
 
 bool RadioModel::isConnected() const
@@ -99,6 +172,10 @@ void RadioModel::connectViaWan(WanConnection* wan, const QString& publicIp, quin
              << "udpPort=" << udpPort
              << "wanHandle=0x" << QString::number(wan->clientHandle(), 16);
 
+    // Disconnect any stale signal connections from a previous WAN session
+    if (m_wanConn)
+        m_wanConn->disconnect(this);
+
     m_wanConn = wan;
     m_wanPublicIp = publicIp;
     m_wanUdpPort = udpPort;
@@ -127,7 +204,9 @@ void RadioModel::disconnectFromRadio()
 {
     m_intentionalDisconnect = true;
     m_reconnectTimer.stop();
+    m_pingTimer.stop();
     if (m_wanConn) {
+        m_wanConn->disconnect(this);  // remove signal connections to prevent duplicates on reconnect (#224)
         m_wanConn->disconnectFromRadio();
         m_wanConn = nullptr;
     } else {
@@ -135,12 +214,27 @@ void RadioModel::disconnectFromRadio()
     }
 }
 
+void RadioModel::forceDisconnect()
+{
+    // Close TCP without setting m_intentionalDisconnect — allows auto-reconnect
+    // when the radio reappears in discovery or via the repeating reconnect timer.
+    m_connection.disconnectFromRadio();
+}
+
 void RadioModel::setTransmit(bool tx)
 {
-    // Immediately stop TX audio when unkeying — don't wait for radio's
-    // interlock state to transition through UNKEY_REQUESTED → READY.
-    if (!tx)
-        m_transmitModel.setTransmitting(false);
+    // Track local intent so we can keep TX gating aligned with user/PTT edges
+    // while radio interlock transitions through intermediate states.
+    m_txRequested = tx;
+
+    // Optimistic edge gating:
+    // - TX on: start immediately to keep modem waveform aligned with PTT edge.
+    // - TX off: stop immediately to avoid "stuck TX tail" during UNKEY_REQUESTED.
+    m_transmitModel.setTransmitting(tx);
+    if (!tx && m_txAudioGate) {
+        m_txAudioGate = false;
+        emit txAudioGateChanged(false);
+    }
 
     sendCmd(QString("xmit %1").arg(tx ? 1 : 0));
 }
@@ -156,12 +250,91 @@ QString RadioModel::audioCompressionParam() const
 
 void RadioModel::sendCwKey(bool down)
 {
-    sendCmd(QString("cw key %1").arg(down ? 1 : 0));
+    QString cmd = QString("cw key %1").arg(down ? 1 : 0);
+    sendNetCwCommand(cmd);
 }
 
 void RadioModel::sendCwPaddle(bool dit, bool dah)
 {
-    sendCmd(QString("cw key %1 %2").arg(dit ? 1 : 0).arg(dah ? 1 : 0));
+    QString cmd = QString("cw key %1 %2").arg(dit ? 1 : 0).arg(dah ? 1 : 0);
+    sendNetCwCommand(cmd);
+}
+
+// ── NetCW stream — VITA-49 UDP delivery with redundant sends ────────────────
+
+QByteArray RadioModel::buildNetCwPacket(const QByteArray& payload)
+{
+    // VITA-49 header: 28 bytes + ASCII command payload
+    // Matches FlexLib NetCWStream.AddTXData() packet format
+    const int payloadBytes = payload.size();
+    const int packetWords = static_cast<int>(std::ceil(payloadBytes / 4.0) + 7); // 7 header words
+    const int packetBytes = packetWords * 4;
+
+    QByteArray pkt(packetBytes, '\0');
+    auto* w = reinterpret_cast<quint32*>(pkt.data());
+
+    // Word 0: ExtDataWithStream, C=1, T=0, TSI=3(Other), TSF=1(SampleCount)
+    static int pktCount = 0;
+    quint32 hdr = (0x3u << 28)     // pkt_type = ExtDataWithStream
+                | (1u << 27)       // C = 1 (class ID present)
+                | (0x3u << 22)     // TSI = 3 (Other)
+                | (0x1u << 20)     // TSF = 1 (SampleCount)
+                | ((pktCount & 0x0F) << 16)
+                | (packetWords & 0xFFFF);
+    pktCount = (pktCount + 1) & 0x0F;
+
+    w[0] = qToBigEndian(hdr);
+    w[1] = qToBigEndian(m_netCwStreamId);
+    w[2] = qToBigEndian<quint32>(0x00001C2D);      // OUI (FlexRadio)
+    w[3] = qToBigEndian<quint32>(0x534C03E3);       // ICC=0x534C, PCC=0x03E3
+    w[4] = 0; w[5] = 0; w[6] = 0;                  // timestamps
+
+    // Payload: ASCII command string
+    memcpy(pkt.data() + 28, payload.constData(), payloadBytes);
+
+    return pkt;
+}
+
+void RadioModel::sendNetCwCommand(const QString& baseCmd)
+{
+    if (m_netCwStreamId == 0) {
+        // No netcw stream — fall back to TCP immediate
+        sendCmd(baseCmd.contains("cw key") ?
+            QString(baseCmd).replace("cw key", "cw key immediate") : baseCmd);
+        return;
+    }
+
+    // Build the full command with timing metadata and dedup index
+    // FlexLib format: "cw key 1 time=0x<hex_ms> index=<N> client_handle=0x<handle>"
+    quint64 timeMs = static_cast<quint64>(
+        QDateTime::currentMSecsSinceEpoch() & 0xFFFFFFFF);
+    int index = m_netCwIndex++;
+
+    QString fullCmd = QString("%1 time=0x%2 index=%3 client_handle=0x%4")
+        .arg(baseCmd)
+        .arg(timeMs, 8, 16, QChar('0'))
+        .arg(index)
+        .arg(clientHandle(), 0, 16);
+
+    QByteArray payload = fullCmd.toLatin1();
+    QByteArray packet = buildNetCwPacket(payload);
+
+    // Redundant sends via UDP: 0ms, 5ms, 10ms, 15ms
+    // Radio deduplicates by index — processes first arrival, ignores repeats
+    m_panStream.sendToRadio(packet);
+
+    QTimer::singleShot(5, this, [this, packet]() {
+        m_panStream.sendToRadio(packet);
+    });
+    QTimer::singleShot(10, this, [this, packet]() {
+        m_panStream.sendToRadio(packet);
+    });
+    QTimer::singleShot(15, this, [this, packet]() {
+        m_panStream.sendToRadio(packet);
+    });
+
+    // TCP fallback — guarantees delivery if all UDP packets are lost
+    sendCmd(fullCmd);
 }
 
 void RadioModel::cwAutoTune(int sliceId, bool intermittent)
@@ -195,6 +368,32 @@ void RadioModel::addSlice()
     const QString cmd = QString("slice create pan=%1 freq=%2").arg(m_activePanId, freq);
 
     qCDebug(lcProtocol) << "RadioModel::addSlice:" << cmd;
+    m_connection.sendCommand(cmd, [](int code, const QString& body) {
+        if (code != 0)
+            qCWarning(lcProtocol) << "RadioModel: slice create failed, code"
+                       << Qt::hex << code << "body:" << body;
+        else
+            qCDebug(lcProtocol) << "RadioModel: new slice created, index =" << body;
+    });
+}
+
+void RadioModel::addSliceOnPan(const QString& panId)
+{
+    if (panId.isEmpty()) { addSlice(); return; }
+
+    auto* pan = panadapter(panId);
+    double newFreq = pan ? pan->centerMhz() : 14.1;
+    const double offsetMhz = (pan ? pan->bandwidthMhz() : 0.2) * 0.2;
+    for (auto* s : m_slices) {
+        if (std::abs(s->frequency() - newFreq) < 0.005) {
+            newFreq += offsetMhz;
+            break;
+        }
+    }
+    const QString freq = QString::number(newFreq, 'f', 6);
+    const QString cmd = QString("slice create pan=%1 freq=%2").arg(panId, freq);
+
+    qCDebug(lcProtocol) << "RadioModel::addSliceOnPan:" << cmd;
     m_connection.sendCommand(cmd, [](int code, const QString& body) {
         if (code != 0)
             qCWarning(lcProtocol) << "RadioModel: slice create failed, code"
@@ -392,6 +591,10 @@ void RadioModel::onConnected()
     // Delay network monitor until after client gui registration
     // (pings sent before registration cause "Malformed command" on WAN)
 
+    // Send low bandwidth flag before GUI registration (matches FlexLib order)
+    if (AppSettings::instance().value("LowBandwidthConnect", "False").toString() == "True")
+        sendCmd("client low_bw_connect");
+
     // Register as GUI client FIRST — required before subscriptions,
     // especially on WAN/SmartLink where the radio is stricter.
     const QString clientId = AppSettings::instance().value("GUIClientID").toString();
@@ -425,9 +628,12 @@ void RadioModel::registerAsGuiClient(const QString& clientId)
         sendCmd("client program AetherSDR");
         QString station = AppSettings::instance().value("StationName", "AetherSDR").toString();
         sendCmd(QString("client station %1").arg(station));
+        sendCmd("client set send_reduced_bw_dax=1");
         // Set network MTU for VITA-49 packets (matches FlexLib behavior)
         int mtu = AppSettings::instance().value("NetworkMtu", "1500").toInt();
         sendCmd(QString("client set enforce_network_mtu=1 network_mtu=%1").arg(mtu));
+        // Enable keepalive (matches FlexLib behavior) — ping timer starts in startNetworkMonitor()
+        sendCmd("keepalive enable");
         startNetworkMonitor();
 
     // Full command sequence — each step waits for its R response before sending the next.
@@ -583,7 +789,7 @@ void RadioModel::registerAsGuiClient(const QString& clientId)
                             qCDebug(lcProtocol) << "RadioModel: PC audio disabled, skipping remote_audio_rx (using radio line out)";
                         }
 
-                        // Request DAX TX audio stream (PC mic → radio)
+        // Request DAX TX audio stream (PC mic → radio, DAX mode)
                         sendCmd(
                             "stream create type=dax_tx",
                             [this](int code, const QString& body) {
@@ -591,10 +797,41 @@ void RadioModel::registerAsGuiClient(const QString& clientId)
                                     quint32 id = body.trimmed().toUInt(nullptr, 16);
                                     qCDebug(lcProtocol) << "RadioModel: dax_tx stream created, id:"
                                              << Qt::hex << id;
-                                    sendCmd("transmit set met_in_rx=1");
                                     emit txAudioStreamReady(id);
                                 } else {
-                                    qCWarning(lcProtocol) << "RadioModel: stream create dax_tx failed, code"
+                                    qCWarning(lcProtocol) << "RadioModel: dax_tx failed, code"
+                                               << Qt::hex << code << "body:" << body;
+                                }
+                            });
+
+                        // Request remote audio TX stream (voice mode, VOX monitoring)
+                        // This stream carries mic audio to the radio for voice TX and
+                        // VOX detection. met_in_rx=1 tells the radio to monitor it during RX.
+                        // Create netcw stream for low-latency CW keying via UDP
+                        sendCmd("stream create netcw",
+                            [this](int code, const QString& body) {
+                                if (code == 0) {
+                                    m_netCwStreamId = body.trimmed().toUInt(nullptr, 16);
+                                    m_netCwIndex = 1;
+                                    qCDebug(lcProtocol) << "RadioModel: netcw stream created, id:"
+                                             << Qt::hex << m_netCwStreamId;
+                                } else {
+                                    qCDebug(lcProtocol) << "RadioModel: netcw stream not supported, code"
+                                             << Qt::hex << code << "— using cw key immediate fallback";
+                                }
+                            });
+
+                        sendCmd(
+                            "stream create type=remote_audio_tx",
+                            [this](int code, const QString& body) {
+                                if (code == 0) {
+                                    quint32 id = body.trimmed().toUInt(nullptr, 16);
+                                    qCDebug(lcProtocol) << "RadioModel: remote_audio_tx stream created, id:"
+                                             << Qt::hex << id;
+                                    sendCmd("transmit set met_in_rx=1");
+                                    emit remoteTxStreamReady(id);
+                                } else {
+                                    qCWarning(lcProtocol) << "RadioModel: stream create remote_audio_tx failed, code"
                                                << Qt::hex << code << "body:" << body;
                                 }
                             });
@@ -604,6 +841,16 @@ void RadioModel::registerAsGuiClient(const QString& clientId)
             sendCmd("profile global info");
             sendCmd("sub tnf all");
             sendCmd("sub memories all");
+            // Additional subscriptions (matches SmartSDR connection sequence)
+            sendCmd("sub cwx all");
+            sendCmd("sub dax all");
+            sendCmd("sub daxiq all");
+            sendCmd("sub radio all");
+            sendCmd("sub codec all");
+            sendCmd("sub dvk all");
+            sendCmd("sub usb_cable all");
+            sendCmd("sub spot all");
+            sendCmd("sub license all");
             }); // sub xvtr all
             }); // sub client all
             }); // sub apd all
@@ -618,9 +865,81 @@ void RadioModel::registerAsGuiClient(const QString& clientId)
     }); // client gui
 }
 
+int RadioModel::bandIdForFrequency(double freqMhz) const
+{
+    // Standard amateur HF band ranges → band names matching radio's band_name field
+    struct BandRange { double lo; double hi; const char* name; };
+    static constexpr BandRange bands[] = {
+        {1.8,    2.0,    "160"},
+        {3.5,    4.0,    "80"},
+        {5.0,    5.5,    "60"},
+        {7.0,    7.3,    "40"},
+        {10.1,   10.15,  "30"},
+        {14.0,   14.35,  "20"},
+        {18.068, 18.168, "17"},
+        {21.0,   21.45,  "15"},
+        {24.89,  24.99,  "12"},
+        {28.0,   29.7,   "10"},
+        {50.0,   54.0,   "6"},
+        {144.0,  148.0,  "2m"},
+    };
+
+    for (const auto& b : bands) {
+        if (freqMhz >= b.lo && freqMhz <= b.hi) {
+            // Find the band ID with this name in m_txBandSettings
+            for (auto it = m_txBandSettings.cbegin(); it != m_txBandSettings.cend(); ++it) {
+                if (it->bandName == b.name)
+                    return it->bandId;
+            }
+        }
+    }
+    // Out-of-band or GEN — check for GEN band
+    for (auto it = m_txBandSettings.cbegin(); it != m_txBandSettings.cend(); ++it) {
+        if (it->bandName == "GEN")
+            return it->bandId;
+    }
+    return -1;
+}
+
 void RadioModel::onDisconnected()
 {
     qCDebug(lcProtocol) << "RadioModel: disconnected";
+
+    // Safety: restore ACC TX if we were inhibiting during tune
+    if (m_tuneInhibitActive && m_tuneInhibitBandId >= 0) {
+        // Best effort — connection may already be dead, but try anyway
+        sendCmd(QString("interlock bandset %1 acc_tx_enabled=1").arg(m_tuneInhibitBandId));
+        qDebug() << "Tune PA inhibit: emergency restore ACC TX on band" << m_tuneInhibitBandId;
+        m_tuneInhibitActive = false;
+        m_tuneInhibitBandId = -1;
+    }
+
+    m_txRequested = false;
+    if (m_txAudioGate) {
+        m_txAudioGate = false;
+        emit txAudioGateChanged(false);
+    }
+    m_transmitModel.setTransmitting(false);
+    m_transmitModel.resetState();
+
+    // Reset radio-model-specific state — different radios have different
+    // capabilities (APD, max power, pan count, TGXL, amplifier, XVTR, etc.)
+    // Must re-derive everything from the new radio's status on next connect. (#359)
+    m_tunerModel.setHandle({});       // clear TGXL presence
+    m_xvtrList.clear();
+    m_hasAmplifier = false;
+    m_fullDuplex = false;
+    m_model.clear();
+    m_version.clear();
+    m_chassisSerial.clear();
+    m_callsign.clear();
+    m_region.clear();
+    m_rxAudioStreamId.clear();
+    m_netCwStreamId = 0;
+    m_netCwIndex = 1;
+    m_lineoutGain = 50;
+    m_headphoneGain = 50;
+
     stopNetworkMonitor();
     m_panStream.stop();
     m_panStream.clearRegisteredStreams();
@@ -646,7 +965,8 @@ void RadioModel::onConnectionError(const QString& msg)
 {
     qCWarning(lcProtocol) << "RadioModel: connection error:" << msg;
     emit connectionError(msg);
-    emit connectionStateChanged(false);
+    // Don't emit connectionStateChanged here — onDisconnected already handles it.
+    // Emitting from both causes duplicate disconnect UI triggers on failed reconnects.
 }
 
 void RadioModel::onVersionReceived(const QString& v)
@@ -669,19 +989,31 @@ void RadioModel::startNetworkMonitor()
     m_stateCountdown = 0;
     m_lastErrorCount = 0;
     m_lastPingRtt = 0;
+    m_pingMissCount = 0;
+
+    // Use RadioConnection's socket-level RTT measurement instead of our own
+    // stopwatch. The connection measures RTT at readyRead time (before event
+    // loop dispatch), avoiding inflated values from main thread UI processing.
+    connect(&m_connection, &RadioConnection::pingRttMeasured, this, [this](int ms) {
+        m_pingMissCount = 0;
+        m_lastPingRtt = ms;
+        evaluateNetworkQuality();
+        emit pingReceived();
+    });
 
     connect(&m_pingTimer, &QTimer::timeout, this, [this]() {
         if (!isConnected()) {
             stopNetworkMonitor();
             return;
         }
-        // Send ping and measure RTT
-        m_pingStopwatch.restart();
-        sendCmd("ping", [this](int code, const QString&) {
-            if (code != 0) return;
-            m_lastPingRtt = static_cast<int>(m_pingStopwatch.elapsed());
-            evaluateNetworkQuality();
-        });
+        ++m_pingMissCount;
+        if (m_pingMissCount >= PING_MISS_DISCONNECT) {
+            qDebug() << "RadioModel:" << PING_MISS_DISCONNECT
+                     << "consecutive pings unanswered — forcing disconnect";
+            forceDisconnect();
+            return;
+        }
+        sendCmd("ping");  // RTT measured by RadioConnection::pingRttMeasured
     });
     m_pingTimer.start(1000);
 }
@@ -1078,14 +1410,15 @@ void RadioModel::onStatusReceived(const QString& object,
 
     // "display pan 0x40000000 center=14.1 bandwidth=0.2 ..."
     // Only process status for OUR panadapter (matching client_handle or first unclaimed).
-    static const QRegularExpression panRe(R"(^display pan\s+(0x[0-9A-Fa-f]+)$)");
+    static const QRegularExpression panRe(R"(^display pan\s+(0x[0-9A-Fa-f]+))");
     if (object.startsWith("display pan")) {
         const auto m = panRe.match(object);
         if (m.hasMatch()) {
             const QString panId = m.captured(1);
 
-            // Handle pan removal
-            if (kvs.contains("removed")) {
+            // Handle pan removal — "display pan 0x40000001 removed" arrives
+            // with no '=' so the parser puts the whole string in 'object'
+            if (kvs.contains("removed") || object.endsWith("removed")) {
                 auto* pan = m_panadapters.take(panId);
                 if (pan) {
                     m_panStream.unregisterPanStream(pan->panStreamId());
@@ -1099,6 +1432,14 @@ void RadioModel::onStatusReceived(const QString& object,
                                                             : m_panadapters.firstKey();
                 }
                 return;
+            }
+
+            // Preamp is shared antenna hardware — apply to ALL our pans
+            // regardless of which client's pan status this came from.
+            if (kvs.contains("pre")) {
+                const QString pre = kvs["pre"];
+                for (auto* pan : m_panadapters)
+                    pan->setPreamp(pre);
             }
 
             if (!m_panadapters.contains(panId)) {
@@ -1117,12 +1458,16 @@ void RadioModel::onStatusReceived(const QString& object,
                 m_panadapters[panId] = pan;
                 if (m_activePanId.isEmpty())
                     m_activePanId = panId;
+                // Re-register stream IDs when waterfall ID arrives (it's not
+                // available at pan creation time — comes later in display pan status)
+                connect(pan, &PanadapterModel::waterfallIdChanged,
+                        this, &RadioModel::updateStreamFilters);
                 updateStreamFilters();
                 qCDebug(lcProtocol) << "RadioModel: claimed panadapter" << panId;
                 emit panadapterAdded(pan);
             }
+            handlePanadapterStatus(panId, kvs);
         }
-        handlePanadapterStatus(kvs);
         return;
     }
 
@@ -1133,19 +1478,29 @@ void RadioModel::onStatusReceived(const QString& object,
         const auto m = wfRe.match(object);
         if (m.hasMatch()) {
             const QString wfId = m.captured(1);
-            if (activeWfId().isEmpty()) {
-                // Only claim waterfall when client_handle confirms ownership
+            // Check if this waterfall belongs to one of our panadapters.
+            // The waterfallId is set on PanadapterModel by the "display pan" status
+            // message which contains "waterfall=0x42xxxxxx".
+            bool ours = false;
+            for (auto* pan : m_panadapters) {
+                if (pan->waterfallId() == wfId) { ours = true; break; }
+            }
+            if (!ours) {
+                // Not yet associated via display pan status — check client_handle
                 if (!kvs.contains("client_handle"))
                     return;  // defer — can't confirm ownership yet
                 quint32 owner = kvs["client_handle"].toUInt(nullptr, 16);
                 if (owner != clientHandle())
                     return;  // not our waterfall
-                setActiveWfId(wfId);
-                updateStreamFilters();
-                qCDebug(lcProtocol) << "RadioModel: claimed waterfall" << activeWfId();
-            } else if (wfId != activeWfId()) {
-                return;  // not our waterfall
+                // Own it but don't force-associate — the display pan status
+                // will set the correct waterfallId on the right pan.
+                ours = true;
             }
+
+            if (activeWfId().isEmpty())
+                setActiveWfId(wfId);
+            updateStreamFilters();
+            qCDebug(lcProtocol) << "RadioModel: claimed waterfall" << wfId;
         }
         if (!activeWfConfigured() && !activeWfId().isEmpty() && isConnected()) {
             setActiveWfConfigured(true);
@@ -1188,8 +1543,15 @@ void RadioModel::onStatusReceived(const QString& object,
 
             // Route TunerGeniusXL to TunerModel
             if (model == "TunerGeniusXL" || handle == m_tunerModel.handle()) {
-                if (m_tunerModel.handle().isEmpty())
+                // Always update handle — first status may arrive with 0x00000000
+                // before the real handle is assigned
+                if (handle != "0x00000000" && handle != m_tunerModel.handle()) {
                     m_tunerModel.setHandle(handle);
+                    m_meterModel.setTgxlHandle(handle.toUInt(nullptr, 0));
+                } else if (m_tunerModel.handle().isEmpty()) {
+                    m_tunerModel.setHandle(handle);
+                    m_meterModel.setTgxlHandle(handle.toUInt(nullptr, 0));
+                }
                 m_tunerModel.applyStatus(kvs);
             }
 
@@ -1251,6 +1613,69 @@ void RadioModel::onStatusReceived(const QString& object,
         return;
     }
 
+    // Spot status: "spot 42 callsign=W1AW rx_freq=14.074000 ..."
+    //              "spot 42 removed"
+    //              "spot 42 triggered pan=0x40000000"
+    if (object.startsWith("spot ")) {
+        static const QRegularExpression spotRe(R"(^spot\s+(\d+))");
+        const auto sm = spotRe.match(object);
+        if (sm.hasMatch()) {
+            int idx = sm.captured(1).toInt();
+            if (kvs.isEmpty() && object.contains("removed")) {
+                m_spotModel.removeSpot(idx);
+            } else if (kvs.isEmpty() && object.contains("triggered")) {
+                // Parse pan= from the object string if present
+                static const QRegularExpression panRe2(R"(pan=(0x[0-9A-Fa-f]+))");
+                const auto pm = panRe2.match(object);
+                emit m_spotModel.spotTriggered(idx, pm.hasMatch() ? pm.captured(1) : QString());
+            } else {
+                m_spotModel.applySpotStatus(idx, kvs);
+            }
+        }
+        return;
+    }
+
+    // USB cable status: "usb_cable FTDI-1234 type=cat enable=1 ..."
+    //                   "usb_cable FTDI-1234 bit 0 enable=1 source=active_slice ..."
+    //                   "usb_cable FTDI-1234 removed"
+    if (object.startsWith("usb_cable ")) {
+        QString rest = object.mid(10);  // after "usb_cable "
+        // Serial number is the first word
+        int spaceIdx = rest.indexOf(' ');
+        QString sn = (spaceIdx >= 0) ? rest.left(spaceIdx) : rest;
+
+        if (rest.contains("removed")) {
+            m_usbCableModel.handleRemoved(sn);
+        } else {
+            // Check for bit-level status: remaining object text is "bit <N>"
+            // The CommandParser puts extra object words before the KV split.
+            // "usb_cable FTDI-1234 bit 3" → object="usb_cable FTDI-1234 bit 3", kvs={enable=1,...}
+            QMap<QString, QString> effectiveKvs = kvs;
+            if (spaceIdx >= 0) {
+                QString afterSn = rest.mid(spaceIdx + 1).trimmed();
+                if (afterSn.startsWith("bit ")) {
+                    int bitNum = afterSn.mid(4).trimmed().toInt();
+                    effectiveKvs["_bit_number"] = QString::number(bitNum);
+                }
+            }
+            m_usbCableModel.applyStatus(sn, effectiveKvs);
+        }
+        return;
+    }
+
+    // CWX status: "cwx sent=0", "cwx wpm=20", "cwx macro1=CQ\u007fCQ"
+    if (object == "cwx") {
+        m_cwxModel.applyStatus(kvs);
+        return;
+    }
+
+    // DVK status: "dvk status=idle enabled=1" or "dvk added id=1 name="Recording 1" duration=0"
+    if (object.startsWith("dvk")) {
+        // Pass both the object string (may contain "added"/"deleted") and KVs
+        m_dvkModel.applyStatus(object, kvs);
+        return;
+    }
+
     // Interlock status: "interlock tx_client_handle=0x... state=TRANSMITTING ..."
     if (object == "interlock") {
         // Track TX ownership — only show TX state if we own the transmitter
@@ -1260,8 +1685,36 @@ void RadioModel::onStatusReceived(const QString& object,
             m_txOwnedByUs = (txOwner == clientHandle() || txOwner == 0);
         }
         if (kvs.contains("state")) {
-            bool tx = (kvs["state"] == "TRANSMITTING") && m_txOwnedByUs;
-            m_transmitModel.setTransmitting(tx);
+            const QString state = kvs["state"].toUpper();
+
+            if (!m_txOwnedByUs || !m_txRequested) {
+                // Another client owns TX, or local unkey requested:
+                // force local TX/audio gate off through all interlock states.
+                m_transmitModel.setTransmitting(false);
+                if (m_txAudioGate) {
+                    m_txAudioGate = false;
+                    emit txAudioGateChanged(false);
+                }
+            } else if (state == "TRANSMITTING") {
+                // Radio confirms RF is keyed.
+                m_transmitModel.setTransmitting(true);
+                if (!m_txAudioGate) {
+                    m_txAudioGate = true;
+                    emit txAudioGateChanged(true);
+                }
+            } else {
+                // Local key requested but radio is still in pre-TX transition
+                // (e.g. PTT/TX delay). Keep optimistic TX-on gating for
+                // modem/PTT edge alignment.
+                const bool transitioningToTx =
+                    state.contains("REQUESTED") || state.contains("DELAY");
+                if (!transitioningToTx)
+                    m_transmitModel.setTransmitting(false);
+                if (!transitioningToTx && m_txAudioGate) {
+                    m_txAudioGate = false;
+                    emit txAudioGateChanged(false);
+                }
+            }
         }
         // Emit TX ownership state for title bar indicator
         // txOwnerChanged(otherIsTx, stationName) — true when ANOTHER client has TX
@@ -1357,6 +1810,10 @@ void RadioModel::handleRadioStatus(const QMap<QString, QString>& kvs)
         m_freqErrorPpb = kvs["freq_error_ppb"].toInt();
         changed = true;
     }
+    if (kvs.contains("cal_freq")) {
+        m_calFreqMhz = kvs["cal_freq"].toDouble();
+        changed = true;
+    }
     if (kvs.contains("low_latency_digital_modes")) {
         m_lowLatencyDigital = kvs["low_latency_digital_modes"] == "1";
         changed = true;
@@ -1390,6 +1847,11 @@ void RadioModel::handleRadioStatus(const QMap<QString, QString>& kvs)
         m_frontSpeakerMute = kvs["front_speaker_mute"] == "1";
         audioChanged = true;
     }
+    if (kvs.contains("daxiq_capacity"))
+        m_daxIqModel.setCapacity(kvs["daxiq_capacity"].toInt());
+    if (kvs.contains("daxiq_available"))
+        m_daxIqModel.setAvailable(kvs["daxiq_available"].toInt());
+
     if (audioChanged) emit audioOutputChanged();
     if (changed) emit infoChanged();
 }
@@ -1577,10 +2039,11 @@ void RadioModel::handleGpsStatus(const QString& rawBody)
                            m_gpsTime);
 }
 
-void RadioModel::handlePanadapterStatus(const QMap<QString, QString>& kvs)
+void RadioModel::handlePanadapterStatus(const QString& panId, const QMap<QString, QString>& kvs)
 {
-    // Delegate to active PanadapterModel
-    auto* pan = activePanadapter();
+    // Delegate to the specific PanadapterModel, not just the active one
+    auto* pan = m_panadapters.value(panId, nullptr);
+    if (!pan) pan = activePanadapter();  // fallback
     if (pan) {
         pan->applyPanStatus(kvs);
     }
@@ -1592,9 +2055,26 @@ void RadioModel::handlePanadapterStatus(const QMap<QString, QString>& kvs)
     if (kvs.contains("min_dbm") || kvs.contains("max_dbm")) {
         const float minDbm = kvs.value("min_dbm", "-130").toFloat();
         const float maxDbm = kvs.value("max_dbm", "-20").toFloat();
-        auto* p = activePanadapter();
-        if (p) m_panStream.setDbmRange(p->panStreamId(), minDbm, maxDbm);
+        if (pan) {
+            m_panStream.setDbmRange(pan->panStreamId(), minDbm, maxDbm);
+        }
         emit panadapterLevelChanged(minDbm, maxDbm);
+    }
+    // Track ypixels from radio status — the radio encodes FFT bins as pixel
+    // Y positions (0..ypixels-1), so PanadapterStream needs this for dBm conversion.
+    // Also detect when the radio resets to default dimensions (e.g. after profile
+    // load) and re-request correct dimensions from MainWindow.
+    if (kvs.contains("y_pixels") && pan) {
+        int yPix = kvs["y_pixels"].toInt();
+        if (yPix > 0)
+            m_panStream.setYPixels(pan->panStreamId(), yPix);
+    }
+    if ((kvs.contains("x_pixels") || kvs.contains("y_pixels")) && pan) {
+        int xPix = kvs.value("x_pixels", "0").toInt();
+        int yPix = kvs.value("y_pixels", "0").toInt();
+        // Radio reset to defaults (profile load, reconnect) — re-push real dimensions
+        if ((xPix > 0 && xPix <= 100) || (yPix > 0 && yPix <= 100))
+            emit panDimensionsNeeded(pan->panId());
     }
     if (kvs.contains("ant_list")) {
         const QStringList ants = kvs["ant_list"].split(',', Qt::SkipEmptyParts);
@@ -1626,18 +2106,9 @@ void RadioModel::configurePan()
 {
     if (m_activePanId.isEmpty()) return;
 
-    // Set xpixels and ypixels — the radio requires explicit dimensions before
-    // it will produce valid FFT data.  Note: the command uses "xpixels" (no
-    // underscore) but status messages report "x_pixels" (with underscore).
-    sendCmd(
-        QString("display pan set %1 xpixels=1024 ypixels=700").arg(m_activePanId),
-        [this](int code, const QString&) {
-            if (code != 0)
-                qCWarning(lcProtocol) << "RadioModel: display pan set xpixels/ypixels failed, code"
-                           << Qt::hex << code;
-            else
-                qCDebug(lcProtocol) << "RadioModel: panadapter xpixels=1024 ypixels=700 set OK";
-        });
+    // Request MainWindow to push actual widget dimensions for this pan.
+    // Do NOT hardcode xpixels/ypixels here — MainWindow knows the real sizes.
+    emit panDimensionsNeeded(m_activePanId);
 
     sendCmd(
         QString("display pan set %1 fps=25 min_dbm=-130 max_dbm=-40").arg(m_activePanId),

@@ -21,18 +21,28 @@ public:
     // Add/remove panadapter displays
     PanadapterApplet* addPanadapter(const QString& panId);
     void removePanadapter(const QString& panId);
+    void removeAll();  // remove all applets and reset splitter
     void rekey(const QString& oldId, const QString& newId);
+
+    // Layout: rebuild splitter structure for a given layout ID
+    // layoutId: "1", "2v", "2h", "2h1", "12h", "2x2"
+    // panIds: the pan IDs to place in order (A, B, C, D)
+    void applyLayout(const QString& layoutId, const QStringList& panIds);
 
     // Accessors
     PanadapterApplet* panadapter(const QString& panId) const;
     SpectrumWidget* spectrum(const QString& panId) const;
     int count() const { return m_pans.size(); }
+    QList<PanadapterApplet*> allApplets() const { return m_pans.values(); }
 
     // Active pan (determines which pan the applet column shows controls for)
     QString activePanId() const { return m_activePanId; }
     PanadapterApplet* activeApplet() const;
     SpectrumWidget* activeSpectrum() const;
     void setActivePan(const QString& panId);
+    void setSplitterOrientation(Qt::Orientation o) { m_splitter->setOrientation(o); }
+    void equalizeSizes();
+    void rearrangeLayout(const QString& layoutId);
 
 signals:
     void activePanChanged(const QString& panId);

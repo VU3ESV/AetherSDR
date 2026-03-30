@@ -36,6 +36,10 @@ class MeterModel : public QObject {
 public:
     explicit MeterModel(QObject* parent = nullptr);
 
+    // Set the TGXL amplifier handle so AMP meters can be routed correctly
+    // (TGXL FWD/RL → TunerApplet, PGXL FWD/RL → AmpApplet)
+    void setTgxlHandle(quint32 handle) { m_tgxlHandle = handle; }
+
     // Register or update a meter definition from a TCP status message.
     void defineMeter(const MeterDef& def);
 
@@ -86,6 +90,9 @@ signals:
     // sliceIndex identifies which slice's LEVEL meter this is.
     void sLevelChanged(int sliceIndex, float dbm);
 
+    // Emitted when the ESC meter value changes (signal strength after ESC, dBm).
+    void escLevelChanged(int sliceIndex, float dbm);
+
     // Emitted when TX meters change (power, SWR).
     void txMetersChanged(float fwdPower, float swr);
 
@@ -100,6 +107,10 @@ signals:
     // Emitted when hardware telemetry meters change (PA temp, supply voltage).
     void hwTelemetryChanged(float paTemp, float supplyVolts);
 
+    // Emitted when amplifier meters change (PGXL fwd power, SWR, temp).
+    void ampMetersChanged(float fwdPower, float swr, float temp);
+    void tgxlMetersChanged(float fwdPower, float swr);
+
     // Emitted when any meter value changes (for debug/generic display).
     void meterUpdated(int index, float value);
 
@@ -111,27 +122,42 @@ private:
 
     // Cached indices for fast lookup of important meters
     QMap<int, int> m_sLevelIdxBySlice;  // sliceIndex → meter index for "SLC"/"LEVEL"
+    QMap<int, int> m_escLevelIdxBySlice; // sliceIndex → meter index for "SLC"/"ESC"
     int m_fwdPwrIdx{-1};     // "FWDPWR"
     int m_swrIdx{-1};        // "SWR"
-    int m_micPeakIdx{-1};    // "COD-" / "MICPEAK"
+    int m_micPeakIdx{-1};    // "COD-" / "MICPEAK" (hardware mic)
     int m_compPeakIdx{-1};   // "TX" / "COMPPEAK"
-    int m_micLevelIdx{-1};   // "COD-" / "MIC" (RX level)
+    int m_afterEqIdx{-1};    // "TX" / "AFTEREQ" (compressor input)
+    int m_micLevelIdx{-1};   // "COD-" / "MIC" (hardware mic RX level)
     int m_compLevelIdx{-1};  // "TX" / "COMP" (instantaneous)
     int m_alcIdx{-1};        // "TX" / "HWALC"
     int m_paTempIdx{-1};     // "RAD" / "PATEMP"
     int m_supplyIdx{-1};     // "RAD" / "+13.8A" (supply voltage, point A = before fuse)
+    int m_ampFwdPwrIdx{-1};  // "AMP" / "FWD" (PGXL)
+    int m_ampSwrIdx{-1};     // "AMP" / "RL" (PGXL)
+    int m_ampTempIdx{-1};    // "AMP" / "TEMP"
+    int m_tgxlFwdIdx{-1};   // "AMP" / "FWD" (TGXL — matched by handle)
+    int m_tgxlSwrIdx{-1};   // "AMP" / "RL" (TGXL — matched by handle)
+    quint32 m_tgxlHandle{0}; // TGXL amplifier handle for meter disambiguation
+    float m_tgxlFwdPwr{0.0f};
+    float m_tgxlSwr{1.0f};
 
     // Cached values
     float m_sLevel{-130.0f};
     float m_fwdPower{0.0f};
     float m_swr{1.0f};
     float m_micPeak{-50.0f};
-    float m_compPeak{0.0f};
+    float m_compPeak{0.0f};      // computed gain reduction (displayed)
+    float m_compPeakRaw{-150.0f}; // smoothed COMPPEAK value
+    float m_afterEq{-150.0f};    // smoothed AFTEREQ (compressor input)
     float m_micLevel{-50.0f};
     float m_compLevel{0.0f};
     float m_alc{0.0f};
     float m_paTemp{0.0f};
     float m_supplyVolts{0.0f};
+    float m_ampFwdPwr{0.0f};
+    float m_ampSwr{1.0f};
+    float m_ampTemp{0.0f};
 };
 
 } // namespace AetherSDR

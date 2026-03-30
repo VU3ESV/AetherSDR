@@ -3,6 +3,9 @@
 #include "TitleBar.h"
 #include "PanadapterApplet.h"
 #include "PanadapterStack.h"
+#include "PanLayoutDialog.h"
+#include "core/CommandParser.h"
+#include "models/PanadapterModel.h"
 #include "SpectrumWidget.h"
 #include "SpectrumOverlayMenu.h"
 #include "VfoWidget.h"
@@ -19,21 +22,35 @@
 #include "RadioSetupDialog.h"
 #include "NetworkDiagnosticsDialog.h"
 #include "MemoryDialog.h"
-#include "SpotSettingsDialog.h"
+#include "DxClusterDialog.h"
+#include "CwxPanel.h"
+#include "DvkPanel.h"
+#include "core/DvkWavTransfer.h"
+#include "AmpApplet.h"
 #include "ProfileManagerDialog.h"
 #include "SupportDialog.h"
+#include "ShortcutDialog.h"
 #include "models/SliceModel.h"
 #include "models/MeterModel.h"
 #include "models/TunerModel.h"
 #include "models/TransmitModel.h"
 #include "models/EqualizerModel.h"
+#ifdef HAVE_MIDI
+#include "core/MidiSettings.h"
+#include "MidiMappingDialog.h"
+#endif
 
+#include <memory>
+#include <functional>
 #include <QApplication>
+#include <QProcess>
 #include <QTimer>
 #include <QDateTime>
 #include <QPropertyAnimation>
 #include <QIcon>
+#include <QKeyEvent>
 #include <QPixmap>
+#include <QPainter>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QSplitter>
@@ -48,6 +65,12 @@
 #include <QLabel>
 #include <QCloseEvent>
 #include <QMessageBox>
+#include <QShortcut>
+#include <QPointer>
+#include <QTextEdit>
+#include <QPlainTextEdit>
+#include <QSpinBox>
+#include <QComboBox>
 #include <QProgressDialog>
 #include <QThread>
 #include "core/AppSettings.h"
@@ -64,10 +87,27 @@
 
 namespace AetherSDR {
 
+// ─── Shortcut guard (file-scope for use as std::function<bool()>) ───────────
+
+static bool s_keyboardShortcutsEnabled = false;
+
+static bool isTextInputFocused()
+{
+    auto* w = QApplication::focusWidget();
+    if (!w) return false;
+    return qobject_cast<QLineEdit*>(w) || qobject_cast<QTextEdit*>(w)
+        || qobject_cast<QPlainTextEdit*>(w) || qobject_cast<QSpinBox*>(w)
+        || qobject_cast<QComboBox*>(w);
+}
+
+static bool shortcutGuard() {
+    return s_keyboardShortcutsEnabled && !isTextInputFocused();
+}
+
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
-    setWindowTitle("AetherSDR");
+    setWindowTitle(QString("AetherSDR v%1").arg(QCoreApplication::applicationVersion()));
     setWindowIcon(QIcon(":/icon.png"));
     setMinimumSize(1024, 600);
     resize(1400, 800);
@@ -75,6 +115,11 @@ MainWindow::MainWindow(QWidget* parent)
     applyDarkTheme();
     buildMenuBar();
     buildUI();
+    registerShortcutActions();
+
+    // Install event filter on the application to intercept Space PTT
+    // before child widgets (buttons, combos) consume the key event.
+    qApp->installEventFilter(this);
 
     // ── Wire up discovery ──────────────────────────────────────────────────
     connect(&m_discovery, &RadioDiscovery::radioDiscovered,
@@ -83,6 +128,21 @@ MainWindow::MainWindow(QWidget* parent)
             m_connPanel, &ConnectionPanel::onRadioUpdated);
     connect(&m_discovery, &RadioDiscovery::radioLost,
             m_connPanel, &ConnectionPanel::onRadioLost);
+
+    // ── Heartbeat indicator + disconnect detection via TCP ping ─────────
+    m_heartbeatMissTimer = new QTimer(this);
+    m_heartbeatMissTimer->setInterval(1500);
+    connect(m_heartbeatMissTimer, &QTimer::timeout, this, [this]() {
+        if (m_titleBar) m_titleBar->onHeartbeatLost();
+    });
+
+    // Ping-based heartbeat — covers local, routed, and SmartLink connections
+    connect(&m_radioModel, &RadioModel::pingReceived, this, [this]() {
+        if (m_titleBar) {
+            m_titleBar->onHeartbeat();
+            m_heartbeatMissTimer->start(); // reset miss timer
+        }
+    });
 
     connect(m_connPanel, &ConnectionPanel::connectRequested,
             this, [this](const RadioInfo& info){
@@ -187,6 +247,194 @@ MainWindow::MainWindow(QWidget* parent)
         m_connPanel->setStatusText("SmartLink error: " + err);
     });
 
+    // ── DX Cluster — forward parsed spots to radio ──────────────────────
+    // ── Spot clients on worker thread ─────────────────────────────────────
+    m_dxCluster = new DxClusterClient;
+    m_rbnClient = new DxClusterClient;
+    m_rbnClient->setLogFileName("rbn.log");
+    m_wsjtxClient = new WsjtxClient;
+    m_potaClient = new PotaClient;
+#ifdef HAVE_WEBSOCKETS
+    m_freedvClient = new FreeDvClient;
+#endif
+    m_spotThread = new QThread(this);
+    m_spotThread->setObjectName("SpotClients");
+    m_dxCluster->moveToThread(m_spotThread);
+    m_rbnClient->moveToThread(m_spotThread);
+    m_wsjtxClient->moveToThread(m_spotThread);
+    m_potaClient->moveToThread(m_spotThread);
+#ifdef HAVE_WEBSOCKETS
+    m_freedvClient->moveToThread(m_spotThread);
+#endif
+    m_spotThread->start();
+
+    // ── Spot forwarding: dedup + batch queue + 1/sec flush ────────────────
+
+    // Dedup helper — returns true if spot should be skipped
+    auto isDuplicateSpot = [this](const DxSpot& spot) -> bool {
+        qint64 now = QDateTime::currentMSecsSinceEpoch();
+        auto& as = AppSettings::instance();
+        int lifetimeMs;
+        if (spot.lifetimeSec > 0)
+            lifetimeMs = spot.lifetimeSec * 1000;                      // source-provided
+        else if (spot.source == "WSJT-X")
+            lifetimeMs = as.value("WsjtxSpotLifetime", 120).toInt() * 1000;
+        else if (spot.source == "FreeDV")
+            lifetimeMs = as.value("FreeDvSpotLifetime", 120).toInt() * 1000;  // HAVE_WEBSOCKETS
+        else
+            lifetimeMs = as.value("DxClusterSpotLifetime", 30).toInt() * 60000;
+        auto it = m_spotDedup.find(spot.dxCall);
+        if (it != m_spotDedup.end()) {
+            bool sameFreq = std::abs(it->freqMhz - spot.freqMhz) < 0.001;
+            bool expired = (now - it->addedMs) > lifetimeMs;
+            if (sameFreq && !expired)
+                return true;
+        }
+        m_spotDedup[spot.dxCall] = {spot.freqMhz, now};
+        return false;
+    };
+
+    // Build spot add command and queue for batch send
+    auto queueSpotCmd = [this, isDuplicateSpot](const DxSpot& spot, const QString& source) {
+        if (!m_radioModel.isConnected()) return;
+        if (isDuplicateSpot(spot)) return;
+        QString call = QString(spot.dxCall).replace(' ', QChar(0x7f));
+        QString freq = QString::number(spot.freqMhz, 'f', 6);
+        QString cmd = "spot add callsign=" + call + " rx_freq=" + freq
+                     + " tx_freq=" + freq
+                     + " source=" + source
+                     + " spotter_callsign=" + spot.spotterCall
+                     + " lifetime_seconds=" + QString::number(
+                           spot.lifetimeSec > 0 ? spot.lifetimeSec
+                           : AppSettings::instance().value("DxClusterSpotLifetime", 30).toInt() * 60);
+        if (!spot.comment.isEmpty())
+            cmd += " comment=" + QString(spot.comment).replace(' ', QChar(0x7f));
+        // Apply source-specific color if not already set
+        QString spotColor = spot.color;
+        if (spotColor.isEmpty()) {
+            auto& as = AppSettings::instance();
+            if (source == "DXCluster")
+                spotColor = as.value("DxClusterSpotColor", "#D2B48C").toString();
+            else if (source == "RBN")
+                spotColor = as.value("RbnSpotColor", "#4488FF").toString();
+            else if (source == "FreeDV")
+                spotColor = as.value("FreeDvSpotColor", "#FF8C00").toString();  // HAVE_WEBSOCKETS
+        }
+        if (!spotColor.isEmpty()) {
+            if (spotColor.length() == 7) spotColor = "#FF" + spotColor.mid(1);
+            cmd += " color=" + spotColor;
+        }
+        m_spotCmdBatch.append(cmd);
+    };
+
+    // Flush batch: send queued spot commands to radio (1/sec)
+    auto* spotCmdTimer = new QTimer(this);
+    spotCmdTimer->start(1000);
+    connect(spotCmdTimer, &QTimer::timeout, this, [this] {
+        if (m_spotCmdBatch.isEmpty() || !m_radioModel.isConnected()) return;
+        // Send up to RbnRateLimit commands per tick
+        int limit = AppSettings::instance().value("RbnRateLimit", 10).toInt();
+        int count = std::min(static_cast<int>(m_spotCmdBatch.size()), limit);
+        for (int i = 0; i < count; ++i)
+            m_radioModel.sendCommand(m_spotCmdBatch[i]);
+        m_spotCmdBatch.remove(0, count);
+    });
+
+    connect(m_dxCluster, &DxClusterClient::spotReceived,
+            this, [queueSpotCmd](const DxSpot& spot) {
+        queueSpotCmd(spot, "DXCluster");
+    });
+
+    connect(m_rbnClient, &DxClusterClient::spotReceived,
+            this, [queueSpotCmd](const DxSpot& spot) {
+        queueSpotCmd(spot, "RBN");
+    });
+
+    connect(m_wsjtxClient, &WsjtxClient::spotReceived,
+            this, [this, isDuplicateSpot](const DxSpot& spot) {
+        if (!m_radioModel.isConnected()) return;
+        if (isDuplicateSpot(spot)) return;
+
+        auto& as = AppSettings::instance();
+        const QString& msg = spot.comment;
+        bool isCQ = msg.startsWith("CQ ");
+        bool isPOTA = msg.contains("CQ POTA");
+        bool isCallingMe = false;
+        {
+            QString myCall = as.value("DxClusterCallsign").toString();
+            if (!myCall.isEmpty()) {
+                QStringList parts = msg.split(' ', Qt::SkipEmptyParts);
+                if (parts.size() >= 2 && parts[0] == myCall)
+                    isCallingMe = true;
+            }
+        }
+
+        // Filter
+        bool fCQ   = as.value("WsjtxFilterCQ", "True").toString() == "True";
+        bool fPOTA = as.value("WsjtxFilterPOTA", "True").toString() == "True";
+        bool fMe   = as.value("WsjtxFilterCallingMe", "True").toString() == "True";
+        bool anyFilter = fCQ || fPOTA || fMe;
+        if (anyFilter) {
+            bool pass = false;
+            if (fCQ && isCQ) pass = true;
+            if (fPOTA && isPOTA) pass = true;
+            if (fMe && isCallingMe) pass = true;
+            if (!pass) return;
+        }
+
+        // Color
+        DxSpot colored = spot;
+        if (isCallingMe)
+            colored.color = as.value("WsjtxColorCallingMe", "#FF0000").toString();
+        else if (isPOTA)
+            colored.color = as.value("WsjtxColorPOTA", "#00FFFF").toString();
+        else if (isCQ)
+            colored.color = as.value("WsjtxColorCQ", "#00FF00").toString();
+        else
+            colored.color = as.value("WsjtxColorDefault", "#FFFFFF").toString();
+
+        // Compute alpha from SNR: -24→64, 0→192, +10→255 (linear interpolation)
+        int alpha;
+        if (colored.snr <= -24)
+            alpha = 64;
+        else if (colored.snr >= 10)
+            alpha = 255;
+        else if (colored.snr <= 0)
+            alpha = 64 + (colored.snr + 24) * (192 - 64) / 24;   // -24..0 → 64..192
+        else
+            alpha = 192 + colored.snr * (255 - 192) / 10;         // 0..+10 → 192..255
+
+        // Convert to #AARRGGBB format for radio
+        if (colored.color.length() == 7)  // #RRGGBB → #AARRGGBB
+            colored.color = QString("#%1%2").arg(alpha, 2, 16, QChar('0')).arg(colored.color.mid(1));
+
+        QString call = QString(colored.dxCall).replace(' ', QChar(0x7f));
+        QString freq = QString::number(colored.freqMhz, 'f', 6);
+        QString cmd = "spot add callsign=" + call + " rx_freq=" + freq
+                     + " tx_freq=" + freq
+                     + " source=WSJT-X"
+                     + " spotter_callsign=" + colored.spotterCall
+                     + " lifetime_seconds=" + QString::number(
+                           as.value("WsjtxSpotLifetime", 120).toInt());
+        if (!colored.comment.isEmpty())
+            cmd += " comment=" + QString(colored.comment).replace(' ', QChar(0x7f));
+        if (!colored.color.isEmpty())
+            cmd += " color=" + colored.color;
+        m_spotCmdBatch.append(cmd);
+    });
+
+    connect(m_potaClient, &PotaClient::spotReceived,
+            this, [queueSpotCmd](const DxSpot& spot) {
+        queueSpotCmd(spot, "POTA");
+    });
+
+#ifdef HAVE_WEBSOCKETS
+    connect(m_freedvClient, &FreeDvClient::spotReceived,
+            this, [queueSpotCmd](const DxSpot& spot) {
+        queueSpotCmd(spot, "FreeDV");
+    });
+#endif
+
     // ── Wire up radio model ────────────────────────────────────────────────
     connect(&m_radioModel, &RadioModel::connectionStateChanged,
             this, &MainWindow::onConnectionStateChanged);
@@ -209,10 +457,28 @@ MainWindow::MainWindow(QWidget* parent)
     connect(&m_radioModel, &RadioModel::txAudioStreamReady,
             this, [this](quint32 streamId) {
         m_audio.setTxStreamId(streamId);
-        m_audio.setOpusTxEnabled(m_radioModel.audioCompressionParam() == "opus");
+        // TX audio on remote_audio_tx always requires Opus (radio enforces compression=OPUS)
+        m_audio.setOpusTxEnabled(true);
         qDebug() << "MainWindow: DAX TX stream ID set to" << Qt::hex << streamId;
         // Start PC audio TX if mic_selection is PC
         if (m_radioModel.transmitModel()->micSelection() == "PC") {
+            m_audio.startTxStream(
+                m_radioModel.connection()->radioAddress(),
+                4991);
+        }
+    });
+    connect(&m_radioModel, &RadioModel::remoteTxStreamReady,
+            this, [this](quint32 streamId) {
+        m_audio.setRemoteTxStreamId(streamId);
+        // Restore PC mic gain from client-side settings (radio has no
+        // hardware gain stage for PC input — client-authoritative)
+        if (m_radioModel.transmitModel()->micSelection() == "PC") {
+            int gain = AppSettings::instance().value("PcMicGain", 100).toInt();
+            m_audio.setPcMicGain(gain);
+        }
+        qDebug() << "MainWindow: remote audio TX stream ID set to" << Qt::hex << streamId;
+        // Ensure mic TX stream is running for VOX monitoring
+        if (!m_audio.isTxStreaming()) {
             m_audio.startTxStream(
                 m_radioModel.connection()->radioAddress(),
                 4991);
@@ -222,6 +488,9 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_radioModel.transmitModel(), &TransmitModel::micStateChanged,
             this, [this]() {
         if (m_radioModel.transmitModel()->micSelection() == "PC") {
+            // Restore PC mic gain from client-side settings
+            int gain = AppSettings::instance().value("PcMicGain", 100).toInt();
+            m_audio.setPcMicGain(gain);
             // Only start if TX stream ID is already assigned (avoid streamId=0)
             if (!m_audio.isTxStreaming() && m_audio.txStreamId() != 0) {
                 m_audio.startTxStream(
@@ -229,7 +498,19 @@ MainWindow::MainWindow(QWidget* parent)
                     4991);
             }
         } else {
+            // Reset to full gain — radio handles hardware mic gain
+            m_audio.setPcMicGain(100);
             m_audio.stopTxStream();
+        }
+    });
+    // Sync PC mic gain directly from slider (radio ignores mic_level for PC input)
+    connect(m_appletPanel->phoneCwApplet(), &PhoneCwApplet::micLevelChanged,
+            this, [this](int level) {
+        if (m_radioModel.transmitModel()->micSelection() == "PC") {
+            m_audio.setPcMicGain(level);
+            auto& s = AppSettings::instance();
+            s.setValue("PcMicGain", level);
+            s.save();
         }
     });
 
@@ -244,7 +525,13 @@ MainWindow::MainWindow(QWidget* parent)
         }
         if (!m_panStack && m_panApplet)
             m_panApplet->spectrumWidget()->setTransmitting(tx);
+        // Keep TX audio source strictly aligned with the local MOX edge for all
+        // modes (SSB + DAX). Waiting for interlock introduces audible lag.
         m_audio.setTransmitting(tx);
+#if defined(Q_OS_MAC) || defined(HAVE_PIPEWIRE)
+        if (m_daxBridge)
+            m_daxBridge->setTransmitting(tx);
+#endif
 
         // Update TX status bar indicator
         if (tx) {
@@ -264,13 +551,23 @@ MainWindow::MainWindow(QWidget* parent)
             }
         }
 #endif
-#if defined(Q_OS_MAC) || defined(HAVE_PIPEWIRE)
-        if (m_daxBridge)
-            m_daxBridge->setTransmitting(tx);
-#endif
 #ifdef HAVE_SERIALPORT
         m_serialPort.setTransmitting(tx);
 #endif
+    });
+
+    // Interlock fallback gate:
+    // we only consume TX-off here, as a safety net if local edge updates
+    // are missed while interlock transitions.
+    connect(&m_radioModel, &RadioModel::txAudioGateChanged,
+            this, [this](bool tx) {
+        if (!tx) {
+            m_audio.setTransmitting(false);
+#if defined(Q_OS_MAC) || defined(HAVE_PIPEWIRE)
+            if (m_daxBridge)
+                m_daxBridge->setTransmitting(false);
+#endif
+        }
     });
 
     // Sync show-TX-in-waterfall setting to all spectrum widgets
@@ -304,7 +601,7 @@ MainWindow::MainWindow(QWidget* parent)
             this, [this](quint32 streamId, const QVector<float>& bins,
                          double low, double high, quint32 tc) {
         for (auto* pan : m_radioModel.panadapters()) {
-            if (pan->panStreamId() == streamId) {
+            if (pan->wfStreamId() == streamId) {
                 if (auto* sw = m_panStack->spectrum(pan->panId()))
                     sw->updateWaterfallRow(bins, low, high, tc);
                 return;
@@ -315,7 +612,7 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_radioModel.panStream(), &PanadapterStream::waterfallAutoBlackLevel,
             this, [this](quint32 streamId, quint32 autoBlack) {
         for (auto* pan : m_radioModel.panadapters()) {
-            if (pan->panStreamId() == streamId) {
+            if (pan->wfStreamId() == streamId) {
                 if (auto* sw = m_panStack->spectrum(pan->panId())) {
                     if (sw->wfAutoBlack()) {
                         const int level = std::clamp(static_cast<int>(autoBlack), 0, 125);
@@ -326,8 +623,8 @@ MainWindow::MainWindow(QWidget* parent)
             }
         }
     });
-    connect(&m_radioModel, &RadioModel::panadapterInfoChanged,
-            spectrum(), &SpectrumWidget::setFrequencyRange);
+    // Legacy panadapterInfoChanged — only used for initial display settings push.
+    // Per-pan frequency/level tracking is done via PanadapterModel signals in panadapterAdded.
     connect(&m_radioModel, &RadioModel::panadapterInfoChanged,
             this, [this]() {
         if (!m_displaySettingsPushed) {
@@ -364,6 +661,10 @@ MainWindow::MainWindow(QWidget* parent)
     // ── Multi-panadapter lifecycle ──────────────────────────────────────────
     connect(&m_radioModel, &RadioModel::panadapterAdded,
             this, [this](PanadapterModel* pan) {
+        // During layout application, applyLayout/createPansSequentially handles
+        // applet creation and wiring — don't duplicate here.
+        if (m_applyingLayout) return;
+
         // Skip if this pan already has an applet
         if (m_panStack->panadapter(pan->panId())) {
             connect(pan, &PanadapterModel::infoChanged,
@@ -375,80 +676,138 @@ MainWindow::MainWindow(QWidget* parent)
 
         PanadapterApplet* applet = nullptr;
 
+        // If applyLayout already created this applet, just wire signals
+        if (m_panStack->panadapter(pan->panId())) {
+            applet = m_panStack->panadapter(pan->panId());
+        }
         // Reuse the "default" placeholder for the first real pan
-        if (m_panStack->panadapter("default")) {
+        else if (m_panStack->panadapter("default")) {
             applet = m_panStack->panadapter("default");
             applet->setPanId(pan->panId());
             m_panStack->rekey("default", pan->panId());
         } else {
             applet = m_panStack->addPanadapter(pan->panId());
-            wirePanadapter(applet);
         }
-        m_panApplet = applet;
+        setActivePanApplet(applet);
         wirePanadapter(applet);
         connect(pan, &PanadapterModel::infoChanged,
                 applet->spectrumWidget(), &SpectrumWidget::setFrequencyRange);
         connect(pan, &PanadapterModel::levelChanged,
                 applet->spectrumWidget(), &SpectrumWidget::setDbmRange);
+
+        // Push display dimensions to the radio so it sends full-size FFT bins.
+        // Without this, the radio uses xpixels=50 ypixels=20 (default) and
+        // FFT data is essentially empty/unusable. Use actual widget dimensions
+        // for 1:1 bin-to-pixel mapping (matches SmartSDR behavior from pcap).
+        auto* sw = applet->spectrumWidget();
+        int xpix = sw ? sw->width() : 1024;
+        int ypix = sw ? sw->height() : 700;
+        if (xpix < 100) xpix = 1024;  // widget may not be laid out yet
+        if (ypix < 100) ypix = 700;
+        m_radioModel.sendCommand(
+            QString("display pan set %1 xpixels=%2 ypixels=%3")
+                .arg(pan->panId()).arg(xpix).arg(ypix));
+
+        // Tell PanadapterStream the ypixels for FFT bin→dBm conversion
+        if (pan->panStreamId())
+            m_radioModel.panStream()->setYPixels(pan->panStreamId(), ypix);
+
         qDebug() << "MainWindow: added panadapter applet for" << pan->panId();
+
+        // Debounced layout restore: after all pans are added on connect,
+        // rearrange to the saved layout (e.g. 2h instead of default vertical).
+        if (!m_layoutRestoreTimer) {
+            m_layoutRestoreTimer = new QTimer(this);
+            m_layoutRestoreTimer->setSingleShot(true);
+            m_layoutRestoreTimer->setInterval(1000);
+            connect(m_layoutRestoreTimer, &QTimer::timeout, this, [this]() {
+                // The radio restores pans from the GUIClientID session.
+                // Accept whatever the radio gives and arrange based on count.
+                int panCount = m_panStack->count();
+                if (panCount <= 1) return;  // single pan, nothing to arrange
+                // Pick a layout based on the number of pans the radio restored
+                const QString saved = AppSettings::instance()
+                    .value("PanadapterLayout", "1").toString();
+                // Only rearrange if the saved layout matches the pan count
+                static const QMap<QString, int> layoutPanCount = {
+                    {"2v", 2}, {"2h", 2}, {"2h1", 3}, {"12h", 3}, {"2x2", 4}, {"1", 1}
+                };
+                if (layoutPanCount.value(saved, 1) == panCount)
+                    m_panStack->rearrangeLayout(saved);
+                else if (panCount == 2)
+                    m_panStack->rearrangeLayout("2v");  // default 2-pan to vertical
+                else if (panCount == 3)
+                    m_panStack->rearrangeLayout("2h1"); // default 3-pan
+                else if (panCount >= 4)
+                    m_panStack->rearrangeLayout("2x2"); // default 4-pan
+
+                // Defensive re-push xpixels for all pans after layout settles.
+                // Covers race where radio hadn't finished pan init when first push arrived.
+                QTimer::singleShot(500, this, [this]() {
+                    for (auto* applet : m_panStack->allApplets()) {
+                        auto* sw = applet->spectrumWidget();
+                        auto* pan = m_radioModel.panadapter(applet->panId());
+                        if (!sw || !pan) continue;
+                        int xpix = qMax(sw->width(), 1024);
+                        int ypix = qMax(sw->height(), 200);
+                        m_radioModel.sendCommand(
+                            QString("display pan set %1 xpixels=%2 ypixels=%3")
+                                .arg(pan->panId()).arg(xpix).arg(ypix));
+                        if (pan->panStreamId())
+                            m_radioModel.panStream()->setYPixels(pan->panStreamId(), ypix);
+                    }
+                });
+            });
+        }
+        m_layoutRestoreTimer->start();  // restart on each new pan
     });
+    // Re-push xpixels/ypixels when the radio requests it (profile change, reconnect, etc.)
+    connect(&m_radioModel, &RadioModel::panDimensionsNeeded,
+            this, [this](const QString& panId) {
+        auto* applet = m_panStack->panadapter(panId);
+        if (!applet) return;
+        auto* sw = applet->spectrumWidget();
+        auto* pan = m_radioModel.panadapter(panId);
+        if (!sw || !pan) return;
+        int xpix = sw->width();
+        int ypix = sw->height();
+        if (xpix < 100) xpix = 1024;
+        if (ypix < 100) ypix = 700;
+        m_radioModel.sendCommand(
+            QString("display pan set %1 xpixels=%2 ypixels=%3")
+                .arg(panId).arg(xpix).arg(ypix));
+        if (pan->panStreamId())
+            m_radioModel.panStream()->setYPixels(pan->panStreamId(), ypix);
+    });
+
     connect(&m_radioModel, &RadioModel::panadapterRemoved,
             this, [this](const QString& panId) {
+        // Disconnect all signals from the dying applet's widgets to prevent
+        // dangling pointer crashes in wirePanadapter lambdas (#242)
+        if (auto* applet = m_panStack->panadapter(panId)) {
+            if (auto* sw = applet->spectrumWidget()) {
+                sw->disconnect(this);
+                if (auto* menu = sw->overlayMenu())
+                    menu->disconnect(this);
+            }
+        }
         m_panStack->removePanadapter(panId);
         qDebug() << "MainWindow: removed panadapter applet for" << panId;
+
+        // Rearrange remaining pans to a sensible layout
+        int remaining = m_panStack->count();
+        if (remaining == 1)
+            AppSettings::instance().setValue("PanadapterLayout", "1");
+        else if (remaining == 2)
+            m_panStack->rearrangeLayout("2v");
+        else if (remaining == 3)
+            m_panStack->rearrangeLayout("2h1");
     });
 
     // ── Per-panadapter signal wiring (extracted for multi-pan support) ──────
     wirePanadapter(m_panApplet);
 
-    // ── Display sub-panel → SpectrumWidget (client-side for now) ─────────
-    auto* overlay = spectrum()->overlayMenu();
-    connect(overlay, &SpectrumOverlayMenu::fftFillAlphaChanged,
-            spectrum(), &SpectrumWidget::setFftFillAlpha);
-    connect(overlay, &SpectrumOverlayMenu::fftFillColorChanged,
-            spectrum(), &SpectrumWidget::setFftFillColor);
-    // FFT controls → SpectrumWidget (local) + RadioModel (radio command)
-    connect(overlay, &SpectrumOverlayMenu::fftAverageChanged,
-            this, [this](int v) {
-        spectrum()->setFftAverage(v);
-        m_radioModel.setPanAverage(v);
-    });
-    connect(overlay, &SpectrumOverlayMenu::fftFpsChanged,
-            this, [this](int v) {
-        spectrum()->setFftFps(v);
-        m_radioModel.setPanFps(v);
-    });
-    connect(overlay, &SpectrumOverlayMenu::fftWeightedAverageChanged,
-            this, [this](bool on) {
-        spectrum()->setFftWeightedAvg(on);
-        m_radioModel.setPanWeightedAverage(on);
-    });
-    // Waterfall controls → SpectrumWidget (local) + RadioModel (radio command)
-    connect(overlay, &SpectrumOverlayMenu::wfColorGainChanged,
-            this, [this](int v) {
-        spectrum()->setWfColorGain(v);
-        m_radioModel.setWaterfallColorGain(v);
-    });
-    connect(overlay, &SpectrumOverlayMenu::wfBlackLevelChanged,
-            this, [this](int v) {
-        spectrum()->setWfBlackLevel(v);
-        m_radioModel.setWaterfallBlackLevel(v);
-    });
-    connect(overlay, &SpectrumOverlayMenu::wfAutoBlackChanged,
-            this, [this](bool on) {
-        spectrum()->setWfAutoBlack(on);
-        m_radioModel.setWaterfallAutoBlack(on);
-    });
-    connect(overlay, &SpectrumOverlayMenu::wfLineDurationChanged,
-            this, [this](int ms) {
-        spectrum()->setWfLineDuration(ms);
-        m_radioModel.setWaterfallLineDuration(ms);
-    });
-    // Noise floor auto-adjust (client-side, adjusts min_dbm)
-    connect(overlay, &SpectrumOverlayMenu::noiseFloorPositionChanged,
-            spectrum(), &SpectrumWidget::setNoiseFloorPosition);
-    connect(overlay, &SpectrumOverlayMenu::noiseFloorEnableChanged,
-            spectrum(), &SpectrumWidget::setNoiseFloorEnable);
+    // Display overlay connections are now per-pan in wirePanadapter().
 
     // ── Panadapter stream → audio engine ──────────────────────────────────
     // All VITA-49 traffic arrives on the single client udpport socket owned
@@ -457,13 +816,21 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_radioModel.panStream(), &PanadapterStream::audioDataReady,
             &m_audio, &AudioEngine::feedAudioData);
 
-    // ── CW decoder: feed audio + display decoded text ─────────────────────
+    // ── BNR container autostart ─────────────────────────────────────────
+#ifdef HAVE_BNR
+    if (AppSettings::instance().value("BnrAutostart", "False").toString() == "True") {
+        QString container = AppSettings::instance().value("BnrContainerName", "maxine-bnr").toString();
+        qDebug() << "BNR: autostarting container" << container;
+        QProcess::startDetached("docker", {"start", container});
+    }
+#endif
+
+    // ── CW decoder: feed audio ──────────────────────────────────────────
+    // Audio feed is global (same audio for all pans).
+    // Text/stats output is wired to m_panApplet via setActivePanApplet()
+    // which re-wires on active pan change.
     connect(m_radioModel.panStream(), &PanadapterStream::audioDataReady,
             &m_cwDecoder, &CwDecoder::feedAudio);
-    connect(&m_cwDecoder, &CwDecoder::textDecoded,
-            m_panApplet, &PanadapterApplet::appendCwText);
-    connect(&m_cwDecoder, &CwDecoder::statsUpdated,
-            m_panApplet, &PanadapterApplet::setCwStats);
 
     // ── AF gain from applet panel → radio per-slice audio_level ─────────
     connect(m_appletPanel->rxApplet(), &RxApplet::afGainChanged, this, [this](int v) {
@@ -475,56 +842,57 @@ MainWindow::MainWindow(QWidget* parent)
     // since spectrum()/vfoWidget() lookups can return null depending on
     // pan activation state.
     auto syncNr2 = [this](bool on) {
-        for (auto* pan : m_radioModel.panadapters()) {
-            auto* sw = m_panStack ? m_panStack->spectrum(pan->panId()) : nullptr;
-            if (!sw) continue;
-            if (auto* vfo = sw->vfoWidget(m_activeSliceId)) {
-                QSignalBlocker sb(vfo->nr2Button());
-                vfo->nr2Button()->setChecked(on);
+        // Iterate PanadapterStack's actual applets — avoids RadioModel→PanStack
+        // ID mismatch during connect when rekey hasn't happened yet.
+        if (m_panStack) {
+            for (auto* applet : m_panStack->allApplets()) {
+                auto* sw = applet->spectrumWidget();
+                if (auto* vfo = sw->vfoWidget(m_activeSliceId)) {
+                    QSignalBlocker sb(vfo->nr2Button());
+                    vfo->nr2Button()->setChecked(on);
+                }
+                if (auto* btn = sw->overlayMenu()->dspNr2Button())
+                    { QSignalBlocker sb(btn); btn->setChecked(on); }
             }
-            if (auto* btn = sw->overlayMenu()->dspNr2Button())
-                { QSignalBlocker sb(btn); btn->setChecked(on); }
-        }
-        // Fallback for single-pan mode without PanadapterStack
-        if (!m_panStack && m_panApplet) {
-            auto* sw = m_panApplet->spectrumWidget();
-            if (auto* vfo = sw->vfoWidget(m_activeSliceId)) {
-                QSignalBlocker sb(vfo->nr2Button());
-                vfo->nr2Button()->setChecked(on);
-            }
-            if (auto* btn = sw->overlayMenu()->dspNr2Button())
-                { QSignalBlocker sb(btn); btn->setChecked(on); }
         }
     };
     auto syncRn2 = [this](bool on) {
-        for (auto* pan : m_radioModel.panadapters()) {
-            auto* sw = m_panStack ? m_panStack->spectrum(pan->panId()) : nullptr;
-            if (!sw) continue;
-            if (auto* vfo = sw->vfoWidget(m_activeSliceId)) {
-                QSignalBlocker sb(vfo->rn2Button());
-                vfo->rn2Button()->setChecked(on);
+        if (m_panStack) {
+            for (auto* applet : m_panStack->allApplets()) {
+                auto* sw = applet->spectrumWidget();
+                if (auto* vfo = sw->vfoWidget(m_activeSliceId)) {
+                    QSignalBlocker sb(vfo->rn2Button());
+                    vfo->rn2Button()->setChecked(on);
+                }
+                if (auto* btn = sw->overlayMenu()->dspRn2Button())
+                    { QSignalBlocker sb(btn); btn->setChecked(on); }
             }
-            if (auto* btn = sw->overlayMenu()->dspRn2Button())
-                { QSignalBlocker sb(btn); btn->setChecked(on); }
         }
-        if (!m_panStack && m_panApplet) {
-            auto* sw = m_panApplet->spectrumWidget();
-            if (auto* vfo = sw->vfoWidget(m_activeSliceId)) {
-                QSignalBlocker sb(vfo->rn2Button());
-                vfo->rn2Button()->setChecked(on);
+    };
+    auto syncBnr = [this](bool on) {
+        if (m_panStack) {
+            for (auto* applet : m_panStack->allApplets()) {
+                auto* sw = applet->spectrumWidget();
+                if (auto* vfo = sw->vfoWidget(m_activeSliceId)) {
+                    QSignalBlocker sb(vfo->bnrButton());
+                    vfo->bnrButton()->setChecked(on);
+                }
+                if (auto* btn = sw->overlayMenu()->dspBnrButton())
+                    { QSignalBlocker sb(btn); btn->setChecked(on); }
             }
-            if (auto* btn = sw->overlayMenu()->dspRn2Button())
-                { QSignalBlocker sb(btn); btn->setChecked(on); }
         }
     };
     connect(&m_audio, &AudioEngine::nr2EnabledChanged, this, syncNr2);
     connect(&m_audio, &AudioEngine::rn2EnabledChanged, this, syncRn2);
+    connect(&m_audio, &AudioEngine::bnrEnabledChanged, this, syncBnr);
     // NR2/RN2 overlay sync is wired in wirePanadapter()
-    // RxApplet NR button 3-state cycle → NR2 enable/disable
+    // RxApplet NR button 3-state cycle → NR2 enable/disable (#329)
     connect(m_appletPanel->rxApplet(), &RxApplet::nr2CycleToggled,
             this, [this](bool on) {
-        if (auto* vfo = spectrum()->vfoWidget())
-            vfo->nr2Button()->setChecked(on);
+        if (on)
+            enableNr2WithWisdom();
+        else
+            m_audio.setNr2Enabled(false);
     });
     // Sync RxApplet NR button visual when NR2 state changes
     connect(&m_audio, &AudioEngine::nr2EnabledChanged,
@@ -544,6 +912,16 @@ MainWindow::MainWindow(QWidget* parent)
             this, [this](bool on) {
         m_audio.setRn2Enabled(on);
     });
+    // Sync RxApplet RNN button visual when RN2 state changes
+    connect(&m_audio, &AudioEngine::rn2EnabledChanged,
+            this, [this](bool on) {
+        auto* rx = m_appletPanel->rxApplet();
+        if (on) {
+            rx->setRnnState(2);
+        } else if (rx->rnnState() == 2) {
+            rx->setRnnState(0);
+        }
+    });
 
 #ifdef HAVE_RADE
     connect(m_appletPanel->rxApplet(), &RxApplet::radeActivated,
@@ -553,7 +931,19 @@ MainWindow::MainWindow(QWidget* parent)
     // ── Tuning step size → spectrum widget ─────────────────────────────────
     connect(m_appletPanel->rxApplet(), &RxApplet::stepSizeChanged,
             spectrum(), &SpectrumWidget::setStepSize);
-    spectrum()->setStepSize(100);
+    connect(m_appletPanel->rxApplet(), &RxApplet::stepSizeChanged,
+            this, [this](int step) {
+        // Send step to radio for the active slice
+        if (auto* s = m_radioModel.slice(m_activeSliceId))
+            m_radioModel.sendCommand(QString("slice set %1 step=%2").arg(s->sliceId()).arg(step));
+        // Also save to AppSettings for SpectrumWidget scroll-to-tune
+        auto& settings = AppSettings::instance();
+        settings.setValue("TuningStepSize", QString::number(step));
+        settings.save();
+    });
+    int savedStep = AppSettings::instance().value("TuningStepSize", "100").toInt();
+    for (auto* a : m_panStack->allApplets()) a->spectrumWidget()->setStepSize(savedStep);
+    m_appletPanel->rxApplet()->setInitialStepSize(savedStep);
 
     // ── Antenna list from radio → applet panel ─────────────────────────────
     connect(&m_radioModel, &RadioModel::antListChanged,
@@ -568,13 +958,24 @@ MainWindow::MainWindow(QWidget* parent)
         else    m_radioModel.removeRxAudioStream();
     });
     connect(m_titleBar, &TitleBar::masterVolumeChanged, this, [this](int pct) {
-        m_audio.setRxVolume(pct / 100.0f);
+        bool pcAudio = AppSettings::instance().value("PcAudioEnabled", "True").toString() == "True";
+        if (pcAudio)
+            m_audio.setRxVolume(pct / 100.0f);
+        else
+            m_radioModel.setLineoutGain(pct);
         auto& s = AppSettings::instance();
         s.setValue("MasterVolume", QString::number(pct));
         s.save();
     });
     connect(m_titleBar, &TitleBar::headphoneVolumeChanged,
             &m_radioModel, &RadioModel::setHeadphoneGain);
+    connect(m_titleBar, &TitleBar::lineoutMuteChanged, this, [this](bool muted) {
+        m_audio.setMuted(muted);
+        m_radioModel.sendCommand(QString("mixer lineout mute %1").arg(muted ? 1 : 0));
+    });
+    connect(m_titleBar, &TitleBar::headphoneMuteChanged, this, [this](bool muted) {
+        m_radioModel.sendCommand(QString("mixer headphone mute %1").arg(muted ? 1 : 0));
+    });
     connect(&m_radioModel, &RadioModel::audioOutputChanged, this, [this]() {
         m_titleBar->setHeadphoneVolume(m_radioModel.headphoneGain());
     });
@@ -605,6 +1006,10 @@ MainWindow::MainWindow(QWidget* parent)
             m_appletPanel->sMeterWidget(), &SMeterWidget::setTransmitting);
 
     // ── Tuner: MeterModel TX meters → TunerApplet gauges ────────────────
+    // Use TGXL-specific meters when available (disambiguated from PGXL by handle)
+    connect(m_radioModel.meterModel(), &MeterModel::tgxlMetersChanged,
+            m_appletPanel->tunerApplet(), &TunerApplet::updateMeters);
+    // Fallback: TX meters for radios without TGXL AMP meters
     connect(m_radioModel.meterModel(), &MeterModel::txMetersChanged,
             m_appletPanel->tunerApplet(), &TunerApplet::updateMeters);
     m_appletPanel->tunerApplet()->setTunerModel(m_radioModel.tunerModel());
@@ -630,6 +1035,16 @@ MainWindow::MainWindow(QWidget* parent)
     connect(&m_radioModel, &RadioModel::amplifierChanged, this, updatePowerScale);
     connect(&m_radioModel, &RadioModel::amplifierChanged, this, [this](bool present) {
         m_pgxlIndicator->setVisible(present);
+        m_appletPanel->setAmpVisible(present);
+    });
+    connect(m_radioModel.meterModel(), &MeterModel::ampMetersChanged,
+            this, [this](float fwdPwr, float swr, float temp) {
+        m_appletPanel->ampApplet()->setFwdPower(fwdPwr);
+        m_appletPanel->ampApplet()->setSwr(swr);
+        m_appletPanel->ampApplet()->setTemp(temp);
+        // When PGXL is present, S-Meter TX power shows amplifier output, not exciter
+        if (m_radioModel.hasAmplifier())
+            m_appletPanel->sMeterWidget()->setTxMeters(fwdPwr, swr);
     });
     connect(m_radioModel.transmitModel(), &TransmitModel::maxPowerLevelChanged,
             this, updatePowerScale);
@@ -638,6 +1053,7 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_radioModel.meterModel(), &MeterModel::txMetersChanged,
             m_appletPanel->txApplet(), &TxApplet::updateMeters);
     m_appletPanel->txApplet()->setTransmitModel(m_radioModel.transmitModel());
+    m_appletPanel->txApplet()->setTunerModel(m_radioModel.tunerModel());
     m_appletPanel->rxApplet()->setTransmitModel(m_radioModel.transmitModel());
 
     // Hide APD row on radios that don't support it
@@ -661,13 +1077,156 @@ MainWindow::MainWindow(QWidget* parent)
             this, [this](bool dit, bool dah) {
         m_radioModel.sendCwPaddle(dit, dah);
     });
+
+    // ── FlexControl tuning knob ─────────────────────────────────────────
+    // Coalesce rapid encoder steps into a single command every 20ms.
+    // Without this, each step sends a separate TCP command, flooding the
+    // radio and causing the UI to lag behind the knob.
+    m_flexCoalesceTimer.setSingleShot(true);
+    m_flexCoalesceTimer.setInterval(20);
+    connect(&m_flexCoalesceTimer, &QTimer::timeout, this, [this]() {
+        if (m_flexPendingSteps == 0) return;
+        auto* s = activeSlice();
+        if (!s || s->isLocked()) { m_flexPendingSteps = 0; return; }
+        int stepHz = spectrum() ? spectrum()->stepSize() : 100;
+        double newMhz = s->frequency() + m_flexPendingSteps * stepHz / 1e6;
+        m_flexPendingSteps = 0;
+        QString panId = m_panStack ? m_panStack->activePanId() : m_radioModel.panId();
+        if (!panId.isEmpty())
+            m_radioModel.sendCommand(
+                QString("slice m %1 pan=%2").arg(newMhz, 0, 'f', 6).arg(panId));
+        if (spectrum()) spectrum()->setVfoFrequency(newMhz);
+    });
+    connect(&m_flexControl, &FlexControlManager::tuneSteps,
+            this, [this](int steps) {
+        m_flexPendingSteps += steps;
+        if (!m_flexCoalesceTimer.isActive())
+            m_flexCoalesceTimer.start();
+    });
+
+    connect(&m_flexControl, &FlexControlManager::buttonPressed,
+            this, [this](int button, int action) {
+        // Look up configurable action from AppSettings
+        QString key = QString("FlexControlBtn%1Action%2").arg(button).arg(action);
+        auto& settings = AppSettings::instance();
+
+        // Defaults: Btn1=StepUp/StepDown, Btn2=ToggleMox/ToggleTune, Btn3=ToggleMute/ToggleLock
+        static const char* defaults[3][3] = {
+            {"StepUp",     "StepDown",     "None"},
+            {"ToggleMox",  "ToggleTune",   "None"},
+            {"ToggleMute", "ToggleLock",   "None"},
+        };
+        const char* def = (button >= 1 && button <= 3 && action >= 0 && action <= 2)
+                          ? defaults[button-1][action] : "None";
+        QString actionName = settings.value(key, def).toString();
+
+        // Dispatch action
+        if (actionName == "StepUp") {
+            if (auto* rx = m_appletPanel->rxApplet()) rx->cycleStepUp();
+        } else if (actionName == "StepDown") {
+            if (auto* rx = m_appletPanel->rxApplet()) rx->cycleStepDown();
+        } else if (actionName == "ToggleMox") {
+            m_radioModel.setTransmit(!m_radioModel.transmitModel()->isMox());
+        } else if (actionName == "ToggleTune") {
+            bool tuning = m_radioModel.transmitModel()->isTuning();
+            m_radioModel.sendCommand(QString("transmit tune %1").arg(tuning ? 0 : 1));
+        } else if (actionName == "ToggleMute") {
+            m_audio.setMuted(!m_audio.isMuted());
+        } else if (actionName == "ToggleLock") {
+            if (auto* s = activeSlice()) s->setLocked(!s->isLocked());
+        } else if (actionName == "NextSlice") {
+            const auto& slices = m_radioModel.slices();
+            if (slices.size() > 1) {
+                int idx = 0;
+                for (int i = 0; i < slices.size(); ++i) {
+                    if (slices[i]->sliceId() == m_activeSliceId) { idx = i; break; }
+                }
+                int next = (idx + 1) % slices.size();
+                setActiveSlice(slices[next]->sliceId());
+            }
+        } else if (actionName == "PrevSlice") {
+            const auto& slices = m_radioModel.slices();
+            if (slices.size() > 1) {
+                int idx = 0;
+                for (int i = 0; i < slices.size(); ++i) {
+                    if (slices[i]->sliceId() == m_activeSliceId) { idx = i; break; }
+                }
+                int prev = (idx - 1 + slices.size()) % slices.size();
+                setActiveSlice(slices[prev]->sliceId());
+            }
+        }
+    });
+
+    // Auto-detect FlexControl on startup
+    m_flexControl.setInvertDirection(
+        AppSettings::instance().value("FlexControlInvertDir", "False").toString() == "True");
+    if (AppSettings::instance().value("FlexControlAutoDetect", "True").toString() == "True") {
+        QString fcPort = FlexControlManager::detectPort();
+        if (!fcPort.isEmpty()) {
+            m_flexControl.open(fcPort);
+        }
+    }
+#endif
+
+#ifdef HAVE_MIDI
+    // ── MIDI controller ─────────────────────────────────────────────────
+    registerMidiParams();
+    MidiSettings::instance().load();
+    // Load saved bindings
+    auto savedBindings = MidiSettings::instance().loadBindings();
+    for (const auto& b : savedBindings)
+        m_midiControl.addBinding(b);
+    // Auto-connect to last device
+    if (MidiSettings::instance().autoConnect()) {
+        QString dev = MidiSettings::instance().lastDevice();
+        if (!dev.isEmpty())
+            m_midiControl.openPortByName(dev);
+    }
 #endif
 
     // ── P/CW applet: mic meters + ALC meter + model ────────────────────────
-    connect(m_radioModel.meterModel(), &MeterModel::micMetersChanged,
-            m_appletPanel->phoneCwApplet(), &PhoneCwApplet::updateMeters);
+    // Suppress radio CODEC meters when mic_selection=PC (they just show noise).
+    // Client-side metering handles PC mic display below.
+    // Compression gauge: throttled to ~5fps, gated on speech_processor_enable.
+    {
+        auto* compThrottle = new int(0);
+        connect(m_radioModel.meterModel(), &MeterModel::micMetersChanged,
+                this, [this, compThrottle](float micLevel, float compLevel, float micPeak, float compPeak) {
+            // Mic level: hardware mic uses radio meters, PC uses client-side
+            if (m_radioModel.transmitModel()->micSelection() != "PC")
+                m_appletPanel->phoneCwApplet()->updateMeters(micLevel, compLevel, micPeak, 0.0f);
+
+            // Compression gauge: 5fps throttle, gated on PROC, both mic paths
+            if (++(*compThrottle) % 4 == 0) {
+                float comp = m_radioModel.transmitModel()->speechProcessorEnable() ? compPeak : 0.0f;
+                m_appletPanel->phoneCwApplet()->updateCompression(comp);
+            }
+        });
+    }
     connect(m_radioModel.meterModel(), &MeterModel::alcChanged,
             m_appletPanel->phoneCwApplet(), &PhoneCwApplet::updateAlc);
+    // Client-side PC mic metering — radio CODEC meters only see hardware mics.
+    // Apply VU-style ballistics: fast attack, slow decay (~20 dB/sec).
+    {
+        auto* heldLevel = new float(-150.0f);  // persists across calls
+        auto* heldPeak  = new float(-150.0f);
+        connect(&m_audio, &AudioEngine::pcMicLevelChanged,
+                this, [this, heldLevel, heldPeak](float peakDb, float avgDb) {
+            if (m_radioModel.transmitModel()->micSelection() != "PC") return;
+            constexpr float kDecayPerUpdate = 1.0f;  // ~20 dB/sec at 20 updates/sec
+            // Level: fast attack, slow decay
+            if (avgDb > *heldLevel)
+                *heldLevel = avgDb;
+            else
+                *heldLevel = qMax(avgDb, *heldLevel - kDecayPerUpdate);
+            // Peak: fast attack, slower decay
+            if (peakDb > *heldPeak)
+                *heldPeak = peakDb;
+            else
+                *heldPeak = qMax(*heldLevel, *heldPeak - kDecayPerUpdate * 0.5f);
+            m_appletPanel->phoneCwApplet()->updateMeters(*heldLevel, 0.0f, *heldPeak, 0.0f);
+        });
+    }
     m_appletPanel->phoneCwApplet()->setTransmitModel(m_radioModel.transmitModel());
 
     // ── PHNE applet: VOX + CW controls ──────────────────────────────────────
@@ -802,11 +1361,11 @@ MainWindow::MainWindow(QWidget* parent)
     const QString stateB64 = s.value("MainWindowState").toString();
     if (!stateB64.isEmpty())
         restoreState(QByteArray::fromBase64(stateB64.toLatin1()));
-    // Clear stale 3-pane splitter state — now 2-pane layout.
+    // Clear stale splitter state — layout has changed across versions.
     s.remove("SplitterState");
-    // Force 2-pane sizing: spectrum gets all remaining width, applet panel fixed at 260px
+    // Force 4-pane sizing: CWX=0, DVK=0 (hidden), center=stretch, applet=260px
     QTimer::singleShot(0, this, [this]() {
-        m_splitter->setSizes({width() - 260, 260});
+        m_splitter->setSizes({0, 0, width() - 260, 260});
     });
 
     // Auto-popup connection dialog if no saved radio
@@ -851,16 +1410,59 @@ void MainWindow::closeEvent(QCloseEvent* event)
     // Save client-side DSP state before destructor disables them
     s.setValue("ClientNr2Enabled", m_audio.nr2Enabled() ? "True" : "False");
     s.setValue("ClientRn2Enabled", m_audio.rn2Enabled() ? "True" : "False");
+    // BNR not persisted — requires manual enable each session
 
     s.save();
     m_discovery.stopListening();
     m_radioModel.disconnectFromRadio();
     m_audio.stopRxStream();
+
+    // Stop spot client worker thread
+    if (m_spotThread) {
+        m_spotThread->quit();
+        m_spotThread->wait(3000);
+        delete m_dxCluster;  m_dxCluster = nullptr;
+        delete m_rbnClient;  m_rbnClient = nullptr;
+        delete m_wsjtxClient; m_wsjtxClient = nullptr;
+        delete m_potaClient;  m_potaClient = nullptr;
+#ifdef HAVE_WEBSOCKETS
+        delete m_freedvClient; m_freedvClient = nullptr;
+#endif
+    }
+
     QMainWindow::closeEvent(event);
+}
+
+void MainWindow::keyPressEvent(QKeyEvent* event)
+{
+    QMainWindow::keyPressEvent(event);
+}
+
+void MainWindow::keyReleaseEvent(QKeyEvent* event)
+{
+    QMainWindow::keyReleaseEvent(event);
 }
 
 bool MainWindow::eventFilter(QObject* obj, QEvent* event)
 {
+    // Space PTT: intercept at application level so it works regardless of
+    // which widget has focus (buttons, combos, etc. won't steal Space).
+    if (event->type() == QEvent::KeyPress || event->type() == QEvent::KeyRelease) {
+        auto* ke = static_cast<QKeyEvent*>(event);
+        if (ke->key() == Qt::Key_Space && !ke->isAutoRepeat()
+            && m_keyboardShortcutsEnabled && !isTextInputFocused()
+            && m_radioModel.isConnected()) {
+            if (event->type() == QEvent::KeyPress && !m_spacePttActive) {
+                m_spacePttActive = true;
+                m_radioModel.setTransmit(true);
+            } else if (event->type() == QEvent::KeyRelease && m_spacePttActive) {
+                m_spacePttActive = false;
+                m_radioModel.setTransmit(false);
+            }
+            return true;  // consume — don't let buttons activate
+        }
+    }
+
     if (obj == m_networkLabel && event->type() == QEvent::MouseButtonDblClick) {
         NetworkDiagnosticsDialog dlg(&m_radioModel, this);
         dlg.exec();
@@ -868,6 +1470,58 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event)
     }
     if (obj == m_stationNickLabel && event->type() == QEvent::MouseButtonDblClick) {
         toggleConnectionDialog();
+        return true;
+    }
+    if (obj == m_cwxIndicator && event->type() == QEvent::MouseButtonPress) {
+        if (!m_cwxIndicator->isEnabled()) return true;
+        bool show = !m_cwxPanel->isVisible();
+        // Close DVK (mutual exclusion)
+        if (show && m_dvkPanel->isVisible()) {
+            m_dvkPanel->hide();
+            auto* sl = activeSlice();
+            updateKeyerAvailability(sl ? sl->mode() : QString());
+        }
+        m_cwxPanel->setVisible(show);
+        m_cwxIndicator->setStyleSheet(show
+            ? "QLabel { color: #00b4d8; font-weight: bold; font-size: 24px; }"
+            : "QLabel { color: rgba(255,255,255,40); font-weight: bold; font-size: 24px; }");
+        if (show) {
+            auto sizes = m_splitter->sizes();
+            if (sizes.size() >= 4) {
+                int cwxW = 250;
+                int total = sizes[0] + sizes[1] + sizes[2];
+                sizes[0] = cwxW;
+                sizes[1] = 0;
+                sizes[2] = total - cwxW;
+                m_splitter->setSizes(sizes);
+            }
+        }
+        return true;
+    }
+    if (obj == m_dvkIndicator && event->type() == QEvent::MouseButtonPress) {
+        if (!m_dvkIndicator->isEnabled()) return true;
+        bool show = !m_dvkPanel->isVisible();
+        // Close CWX (mutual exclusion)
+        if (show && m_cwxPanel->isVisible()) {
+            m_cwxPanel->hide();
+            auto* sl = activeSlice();
+            updateKeyerAvailability(sl ? sl->mode() : QString());
+        }
+        m_dvkPanel->setVisible(show);
+        m_dvkIndicator->setStyleSheet(show
+            ? "QLabel { color: #00b4d8; font-weight: bold; font-size: 24px; }"
+            : "QLabel { color: rgba(255,255,255,40); font-weight: bold; font-size: 24px; }");
+        if (show) {
+            auto sizes = m_splitter->sizes();
+            if (sizes.size() >= 4) {
+                int dvkW = 250;
+                int total = sizes[0] + sizes[1] + sizes[2];
+                sizes[0] = 0;
+                sizes[1] = dvkW;
+                sizes[2] = total - dvkW;
+                m_splitter->setSizes(sizes);
+            }
+        }
         return true;
     }
     if (obj == m_tnfIndicator && event->type() == QEvent::MouseButtonPress) {
@@ -882,9 +1536,40 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event)
         m_radioModel.setFullDuplex(on);
         return true;
     }
+    if (obj == m_panelToggle && event->type() == QEvent::MouseButtonPress) {
+        bool visible = m_appletPanel->isVisible();
+        m_appletPanel->setVisible(!visible);
+        m_panelToggle->setStyleSheet(!visible
+            ? "QLabel { color: rgba(255,255,255,128); font-weight: bold; font-size: 22px; }"
+            : "QLabel { color: #404858; font-weight: bold; font-size: 22px; }");
+        AppSettings::instance().setValue("AppletPanelVisible", !visible ? "True" : "False");
+        AppSettings::instance().save();
+        if (m_panelVisAction) {
+            QSignalBlocker sb(m_panelVisAction);
+            m_panelVisAction->setChecked(!visible);
+        }
+        return true;
+    }
     if (obj == m_addPanLabel && event->type() == QEvent::MouseButtonPress) {
-        // Multi-pan disabled pending stabilization (#152)
-        // m_radioModel.createPanadapter();
+        if (!m_radioModel.isConnected()) return true;
+        const QString& model = m_radioModel.model();
+        bool dualScu = model.contains("6600") || model.contains("6700")
+                    || model.contains("8600") || model.contains("AU-520");
+        int maxPans = dualScu ? 4 : 2;
+        // Determine current layout from actual pan count, not saved setting
+        int activePanCount = m_panStack ? m_panStack->count() : 1;
+        QString currentLayout = "1";
+        if (activePanCount >= 2)
+            currentLayout = AppSettings::instance()
+                .value("PanadapterLayout", "1").toString();
+        PanLayoutDialog dlg(maxPans, currentLayout, this);
+        if (dlg.exec() == QDialog::Accepted && !dlg.selectedLayout().isEmpty()) {
+            const QString layoutId = dlg.selectedLayout();
+            auto& s = AppSettings::instance();
+            s.setValue("PanadapterLayout", layoutId);
+            s.save();
+            applyPanLayout(layoutId);
+        }
         return true;
     }
     return QMainWindow::eventFilter(obj, event);
@@ -923,22 +1608,40 @@ void MainWindow::buildMenuBar()
 
     auto* radioSetup = settingsMenu->addAction("Radio Setup...");
     connect(radioSetup, &QAction::triggered, this, [this] {
+        if (m_radioSetupDialog) {
+            m_radioSetupDialog->raise();
+            m_radioSetupDialog->activateWindow();
+            return;
+        }
         // Snapshot compression setting before dialog opens
         QString prevComp = m_radioModel.audioCompressionParam();
 
         auto* dlg = new RadioSetupDialog(&m_radioModel, &m_audio, this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
+        m_radioSetupDialog = dlg;
         connect(dlg, &QDialog::finished, this, [this, prevComp]() {
 #ifdef HAVE_SERIALPORT
             // Re-load serial port settings if changed
             m_serialPort.loadSettings();
+            // Re-check FlexControl open/close state
+            auto& fcs = AppSettings::instance();
+            if (fcs.value("FlexControlOpen", "False").toString() == "True") {
+                if (!m_flexControl.isOpen()) {
+                    QString port = fcs.value("FlexControlPort").toString();
+                    if (!port.isEmpty()) m_flexControl.open(port);
+                }
+            } else {
+                if (m_flexControl.isOpen()) m_flexControl.close();
+            }
+            m_flexControl.setInvertDirection(
+                fcs.value("FlexControlInvertDir", "False").toString() == "True");
 #endif
             // Re-evaluate CW decode overlay visibility
             bool decodeOn = AppSettings::instance().value("CwDecodeOverlay", "True").toString() == "True";
             auto* s = activeSlice();
             if (s) {
                 bool isCw = (s->mode() == "CW" || s->mode() == "CWL");
-                m_panApplet->setCwPanelVisible(isCw && decodeOn);
+                if (m_panApplet) m_panApplet->setCwPanelVisible(isCw && decodeOn);
             }
 
             // If audio compression changed, recreate the RX audio stream
@@ -947,7 +1650,8 @@ void MainWindow::buildMenuBar()
                 qDebug() << "MainWindow: audio compression changed from" << prevComp
                          << "to" << newComp << "— recreating audio stream";
                 m_radioModel.removeRxAudioStream();
-                m_audio.setOpusTxEnabled(newComp == "opus");
+                // TX always uses Opus (radio enforces it on remote_audio_tx).
+                // RX compression change doesn't affect TX encoding.
                 QTimer::singleShot(500, this, [this]() {
                     m_radioModel.createRxAudioStream();
                 });
@@ -961,7 +1665,22 @@ void MainWindow::buildMenuBar()
         toggleConnectionDialog();
     });
 
-    settingsMenu->addAction("FlexControl...");
+#ifdef HAVE_SERIALPORT
+    auto* flexControlAction = settingsMenu->addAction("FlexControl...");
+    connect(flexControlAction, &QAction::triggered, this, [this] {
+        auto* dlg = new RadioSetupDialog(&m_radioModel, &m_audio, this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        if (auto* tabs = dlg->findChild<QTabWidget*>()) {
+            for (int i = 0; i < tabs->count(); ++i) {
+                if (tabs->tabText(i) == "Serial") {
+                    tabs->setCurrentIndex(i);
+                    break;
+                }
+            }
+        }
+        dlg->show();
+    });
+#endif
     auto* networkAction = settingsMenu->addAction("Network...");
     connect(networkAction, &QAction::triggered, this, [this] {
         NetworkDiagnosticsDialog dlg(&m_radioModel, this);
@@ -972,11 +1691,114 @@ void MainWindow::buildMenuBar()
         MemoryDialog dlg(&m_radioModel, this);
         dlg.exec();
     });
-    settingsMenu->addAction("USB Cables...");
-    auto* spotsAction = settingsMenu->addAction("Spots...");
+    auto* usbCablesAction = settingsMenu->addAction("USB Cables...");
+    connect(usbCablesAction, &QAction::triggered, this, [this] {
+        auto* dlg = new RadioSetupDialog(&m_radioModel, &m_audio, this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        // Switch to the USB Cables tab
+        if (auto* tabs = dlg->findChild<QTabWidget*>()) {
+            for (int i = 0; i < tabs->count(); ++i) {
+                if (tabs->tabText(i) == "USB Cables") {
+                    tabs->setCurrentIndex(i);
+                    break;
+                }
+            }
+        }
+        dlg->show();
+    });
+#ifdef HAVE_MIDI
+    auto* midiAction = settingsMenu->addAction("MIDI Mapping...");
+    connect(midiAction, &QAction::triggered, this, [this] {
+        if (m_midiDialog) {
+            m_midiDialog->raise();
+            m_midiDialog->activateWindow();
+            return;
+        }
+        auto* dlg = new MidiMappingDialog(&m_midiControl, this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        m_midiDialog = dlg;
+        dlg->show();
+    });
+#endif
+    auto* spotsAction = settingsMenu->addAction("SpotHub...");
     connect(spotsAction, &QAction::triggered, this, [this] {
-        SpotSettingsDialog dlg(&m_radioModel, this);
-        dlg.exec();
+        // Raise existing dialog if already open
+        if (m_spotHubDialog) {
+            m_spotHubDialog->raise();
+            m_spotHubDialog->activateWindow();
+            return;
+        }
+        auto* dlg = new DxClusterDialog(m_dxCluster, m_rbnClient, m_wsjtxClient, m_potaClient,
+#ifdef HAVE_WEBSOCKETS
+                            m_freedvClient,
+#endif
+                            &m_radioModel, this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        m_spotHubDialog = dlg;
+        dlg->setTotalSpots(m_radioModel.spotModel()->spots().size());
+        // Live preview: refresh spots on every display settings change
+        auto refreshSpots = [this]() {
+            auto& s = AppSettings::instance();
+            bool on       = s.value("IsSpotsEnabled", "True").toString() == "True";
+            int fontSize  = s.value("SpotFontSize", "16").toInt();
+            int levels    = s.value("SpotsMaxLevel", "3").toInt();
+            int position  = s.value("SpotsStartingHeightPercentage", "50").toInt();
+            bool override = s.value("IsSpotsOverrideColorsEnabled", "False").toString() == "True";
+            QColor spotColor(s.value("SpotsOverrideColor", "#FFFF00").toString());
+            QColor bgColor(s.value("SpotsOverrideBgColor", "#000000").toString());
+            int bgOpacity = s.value("SpotsBackgroundOpacity", 48).toInt();
+            for (auto* a : m_panStack->allApplets()) {
+                auto* sw = a->spectrumWidget();
+                sw->setShowSpots(on);
+                sw->setSpotFontSize(fontSize);
+                sw->setSpotMaxLevels(levels);
+                sw->setSpotStartPct(position);
+                sw->setSpotOverrideColors(override);
+                sw->setSpotColor(spotColor);
+                sw->setSpotBgColor(bgColor);
+                sw->setSpotBgOpacity(bgOpacity);
+            }
+        };
+        connect(dlg, &DxClusterDialog::settingsChanged, this, refreshSpots);
+        connect(dlg, &DxClusterDialog::connectRequested,
+                this, [this](const QString& host, quint16 port, const QString& call) {
+            QMetaObject::invokeMethod(m_dxCluster, [=] { m_dxCluster->connectToCluster(host, port, call); });
+        });
+        connect(dlg, &DxClusterDialog::disconnectRequested,
+                this, [this] { QMetaObject::invokeMethod(m_dxCluster, [=] { m_dxCluster->disconnect(); }); });
+        connect(dlg, &DxClusterDialog::rbnConnectRequested,
+                this, [this](const QString& host, quint16 port, const QString& call) {
+            QMetaObject::invokeMethod(m_rbnClient, [=] { m_rbnClient->connectToCluster(host, port, call); });
+        });
+        connect(dlg, &DxClusterDialog::rbnDisconnectRequested,
+                this, [this] { QMetaObject::invokeMethod(m_rbnClient, [=] { m_rbnClient->disconnect(); }); });
+        connect(dlg, &DxClusterDialog::wsjtxStartRequested,
+                this, [this](const QString& addr, quint16 port) {
+            QMetaObject::invokeMethod(m_wsjtxClient, [=] { m_wsjtxClient->startListening(addr, port); });
+        });
+        connect(dlg, &DxClusterDialog::wsjtxStopRequested,
+                this, [this] { QMetaObject::invokeMethod(m_wsjtxClient, [=] { m_wsjtxClient->stopListening(); }); });
+        connect(dlg, &DxClusterDialog::potaStartRequested,
+                this, [this](int interval) {
+            QMetaObject::invokeMethod(m_potaClient, [=] { m_potaClient->startPolling(interval); });
+        });
+        connect(dlg, &DxClusterDialog::potaStopRequested,
+                this, [this] { QMetaObject::invokeMethod(m_potaClient, [=] { m_potaClient->stopPolling(); }); });
+#ifdef HAVE_WEBSOCKETS
+        connect(dlg, &DxClusterDialog::freedvStartRequested,
+                this, [this] { QMetaObject::invokeMethod(m_freedvClient, [this] { m_freedvClient->startConnection(); }); });
+        connect(dlg, &DxClusterDialog::freedvStopRequested,
+                this, [this] { QMetaObject::invokeMethod(m_freedvClient, [this] { m_freedvClient->stopConnection(); }); });
+#endif
+        connect(dlg, &DxClusterDialog::spotsClearedAll,
+                this, [this] { m_spotDedup.clear(); });
+        connect(dlg, &DxClusterDialog::tuneRequested,
+                this, [this](double freqMhz) {
+            if (auto* sl = activeSlice())
+                sl->tuneAndRecenter(freqMhz);
+        });
+        connect(dlg, &QDialog::finished, this, refreshSpots);  // refresh on close
+        dlg->show();
     });
     settingsMenu->addAction("multiFLEX...");
     auto* txBandAct = settingsMenu->addAction("TX Band Settings...");
@@ -1091,6 +1913,19 @@ void MainWindow::buildMenuBar()
         dlg->show();
     });
 
+    auto* tuneInhibitAct = settingsMenu->addAction("Inhibit amplifier during TUNE");
+    tuneInhibitAct->setCheckable(true);
+    tuneInhibitAct->setChecked(
+        AppSettings::instance().value("TuneInhibitAmp", "False").toString() == "True");
+    tuneInhibitAct->setToolTip(
+        "Temporarily disable ACC TX output during TUNE to protect external amplifiers.\n"
+        "ACC TX is automatically restored when TUNE completes.");
+    connect(tuneInhibitAct, &QAction::toggled, this, [](bool on) {
+        auto& s = AppSettings::instance();
+        s.setValue("TuneInhibitAmp", on ? "True" : "False");
+        s.save();
+    });
+
     settingsMenu->addSeparator();
 
     auto* autoRigctlAction = settingsMenu->addAction("Autostart rigctld with AetherSDR");
@@ -1123,11 +1958,36 @@ void MainWindow::buildMenuBar()
         s.save();
     });
 
+    auto* lowLatencyDaxTxAction =
+        settingsMenu->addAction("Low-Latency DAX (FreeDV)");
+    lowLatencyDaxTxAction->setCheckable(true);
+    lowLatencyDaxTxAction->setChecked(
+        AppSettings::instance().value("DaxTxLowLatency", "False").toString() == "True");
+    connect(lowLatencyDaxTxAction, &QAction::toggled, this, [this](bool on) {
+        auto& s = AppSettings::instance();
+        s.setValue("DaxTxLowLatency", on ? "True" : "False");
+        s.save();
+        m_audio.setDaxTxUseRadioRoute(!on);
+        m_audio.clearTxAccumulators();
+#if defined(Q_OS_MAC) || defined(HAVE_PIPEWIRE)
+        if (m_daxBridge)
+            m_radioModel.sendCommand(QString("transmit set dax=%1").arg(on ? 0 : 1));
+#endif
+    });
+
     // Connect placeholder items to show "not implemented" message
     for (auto* action : settingsMenu->actions()) {
         if (!action->isSeparator() && action != radioSetup && action != chooseRadio
             && action != networkAction && action != memoryAction && action != spotsAction
-            && action != autoRigctlAction && action != autoCatAction && action != autoDaxAction) {
+            && action != usbCablesAction
+#ifdef HAVE_SERIALPORT
+            && action != flexControlAction
+#endif
+#ifdef HAVE_MIDI
+            && action != midiAction
+#endif
+            && action != autoRigctlAction && action != autoCatAction
+            && action != autoDaxAction && action != lowLatencyDaxTxAction) {
             connect(action, &QAction::triggered, this, [this, action] {
                 statusBar()->showMessage(action->text().remove("...") + " — not yet implemented", 3000);
             });
@@ -1169,13 +2029,48 @@ void MainWindow::buildMenuBar()
 
     auto* viewMenu = menuBar()->addMenu("&View");
 
-    auto* bandPlanAct = viewMenu->addAction("Band Plan Overlay");
-    bandPlanAct->setCheckable(true);
-    bandPlanAct->setChecked(
-        AppSettings::instance().value("ShowBandPlan", "True").toString() == "True");
-    connect(bandPlanAct, &QAction::toggled, this, [this](bool on) {
-        spectrum()->setShowBandPlan(on);
-        AppSettings::instance().setValue("ShowBandPlan", on ? "True" : "False");
+    m_panelVisAction = viewMenu->addAction("Applet Panel");
+    m_panelVisAction->setCheckable(true);
+    m_panelVisAction->setChecked(
+        AppSettings::instance().value("AppletPanelVisible", "True").toString() == "True");
+    connect(m_panelVisAction, &QAction::toggled, this, [this](bool on) {
+        m_appletPanel->setVisible(on);
+        m_panelToggle->setStyleSheet(on
+            ? "QLabel { color: rgba(255,255,255,128); font-weight: bold; font-size: 22px; }"
+            : "QLabel { color: #404858; font-weight: bold; font-size: 22px; }");
+        AppSettings::instance().setValue("AppletPanelVisible", on ? "True" : "False");
+        AppSettings::instance().save();
+    });
+    viewMenu->addSeparator();
+
+    // Band Plan submenu — Off / Small / Medium / Large / Huge
+    auto* bandPlanMenu = viewMenu->addMenu("Band Plan");
+    int savedBpSize = AppSettings::instance().value("BandPlanFontSize", "").toInt();
+    if (savedBpSize == 0 && AppSettings::instance().value("ShowBandPlan", "True").toString() == "True")
+        savedBpSize = 6;  // migrate old boolean setting
+    auto* bpGroup = new QActionGroup(bandPlanMenu);
+    struct BpOption { const char* label; int pt; };
+    for (auto [label, pt] : {BpOption{"Off", 0}, {"Small", 6}, {"Medium", 10}, {"Large", 12}, {"Huge", 16}}) {
+        auto* act = bandPlanMenu->addAction(label);
+        act->setCheckable(true);
+        act->setChecked(pt == savedBpSize);
+        bpGroup->addAction(act);
+        connect(act, &QAction::triggered, this, [this, pt] {
+            for (auto* a : m_panStack->allApplets())
+                a->spectrumWidget()->setBandPlanFontSize(pt);
+            AppSettings::instance().setValue("BandPlanFontSize", QString::number(pt));
+            AppSettings::instance().save();
+        });
+    }
+
+    auto* singleClickTuneAct = viewMenu->addAction("Single-Click to Tune");
+    singleClickTuneAct->setCheckable(true);
+    singleClickTuneAct->setChecked(
+        AppSettings::instance().value("SingleClickTune", "False").toString() == "True");
+    connect(singleClickTuneAct, &QAction::toggled, this, [this](bool on) {
+        for (auto* a : m_panStack->allApplets())
+            a->spectrumWidget()->setSingleClickTune(on);
+        AppSettings::instance().setValue("SingleClickTune", on ? "True" : "False");
         AppSettings::instance().save();
     });
 
@@ -1195,6 +2090,31 @@ void MainWindow::buildMenuBar()
                 QString("UI scale set to %1%. Restart AetherSDR for the change to take effect.").arg(pct));
         });
     }
+
+    auto* resetOrderAct = viewMenu->addAction("Reset Applet Order");
+    connect(resetOrderAct, &QAction::triggered, this, [this] {
+        m_appletPanel->resetOrder();
+    });
+
+    viewMenu->addSeparator();
+    m_keyboardShortcutsEnabled = AppSettings::instance()
+        .value("KeyboardShortcutsEnabled", "False").toString() == "True";
+    auto* kbAct = viewMenu->addAction("Keyboard Shortcuts");
+    kbAct->setCheckable(true);
+    kbAct->setChecked(m_keyboardShortcutsEnabled);
+    connect(kbAct, &QAction::toggled, this, [this](bool on) {
+        m_keyboardShortcutsEnabled = on;
+        s_keyboardShortcutsEnabled = on;
+        AppSettings::instance().setValue("KeyboardShortcutsEnabled", on ? "True" : "False");
+        AppSettings::instance().save();
+    });
+    auto* configShortcutsAct = viewMenu->addAction("Configure Shortcuts...");
+    connect(configShortcutsAct, &QAction::triggered, this, [this] {
+        ShortcutDialog dlg(&m_shortcutManager, this);
+        dlg.exec();
+        // Rebuild shortcuts in case bindings changed
+        m_shortcutManager.rebuildShortcuts(this, shortcutGuard);
+    });
 
     viewMenu->addSeparator();
     auto* themeAct = viewMenu->addAction("Toggle Dark/Light Theme");
@@ -1274,22 +2194,72 @@ void MainWindow::buildUI()
     m_connPanel->setFixedSize(300, 420);
     m_connPanel->hide();
 
+    // CWX panel — left of spectrum, hidden by default
+    m_cwxPanel = new CwxPanel(m_radioModel.cwxModel(), splitter);
+    splitter->addWidget(m_cwxPanel);
+    m_cwxPanel->hide();
+
+    // DVK panel — left of spectrum, hidden by default (mutually exclusive with CWX)
+    m_dvkPanel = new DvkPanel(m_radioModel.dvkModel(), splitter);
+    auto* dvkTransfer = new DvkWavTransfer(&m_radioModel, this);
+    m_dvkPanel->setWavTransfer(dvkTransfer);
+    splitter->addWidget(m_dvkPanel);
+    m_dvkPanel->hide();
+
     // Centre — panadapter stack (one or more FFT + waterfall panes)
     m_panStack = new PanadapterStack(splitter);
-    m_panApplet = m_panStack->addPanadapter("default");
+    m_panApplet = nullptr;  // ensure setActivePanApplet sees a change
+    setActivePanApplet(m_panStack->addPanadapter("default"));
     splitter->addWidget(m_panStack);
-    splitter->setStretchFactor(0, 1);
+
+    // Sync RadioModel's active pan/wf IDs when PanadapterStack focus changes.
+    // This ensures display setting commands (fps, average, black_level, etc.)
+    // target the correct pan.
+    // Sync RadioModel's active pan ID when PanadapterStack focus changes.
+    // This ensures display setting commands (fps, average, black_level, etc.)
+    // target the correct pan — activeWfId() derives from activePanadapter()
+    // which uses m_activePanId.
+    connect(m_panStack, &PanadapterStack::activePanChanged,
+            this, [this](const QString& panId) {
+        m_radioModel.setActivePanId(panId);
+
+        // Update m_panApplet and CW decoder wiring for the new active pan
+        if (auto* applet = m_panStack->panadapter(panId))
+            setActivePanApplet(applet);
+
+        // Show/hide CW decode panel based on the new active pan's slice mode
+        for (auto* sl : m_radioModel.slices()) {
+            if (sl->panId() == panId) {
+                bool isCw = (sl->mode() == "CW" || sl->mode() == "CWL");
+                bool decodeOn = AppSettings::instance().value("CwDecodeOverlay", "True").toString() == "True";
+                if (m_panApplet) m_panApplet->setCwPanelVisible(isCw && decodeOn);
+                if (isCw && !m_cwDecoder.isRunning())
+                    m_cwDecoder.start();
+                else if (!isCw && m_cwDecoder.isRunning())
+                    m_cwDecoder.stop();
+                break;
+            }
+        }
+    });
+    splitter->setStretchFactor(0, 0);  // CWX panel: fixed width
+    splitter->setStretchFactor(1, 0);  // DVK panel: fixed width
+    splitter->setStretchFactor(2, 1);  // PanStack: stretch
+    splitter->setCollapsible(0, false);
+    splitter->setCollapsible(1, false);
 
     // Right — applet panel (includes S-Meter)
     m_appletPanel = new AppletPanel(splitter);
     splitter->addWidget(m_appletPanel);
-    splitter->setStretchFactor(1, 0);
-    splitter->setCollapsible(1, false);
+    splitter->setStretchFactor(3, 0);
+    splitter->setCollapsible(3, false);
 
-    // Set initial splitter sizes: left=260, center=stretch, right=310
-    // The center pane gets whatever is left after the fixed-width sidebars.
-    const int centerWidth = qMax(400, width() - 260 - 310);
-    splitter->setSizes({260, centerWidth, 310});
+    // Set initial splitter sizes: CWX=0, DVK=0 (both hidden), center=stretch, right=310
+    const int centerWidth = qMax(400, width() - 310);
+    splitter->setSizes({0, 0, centerWidth, 310});
+
+    // Restore applet panel visibility
+    if (AppSettings::instance().value("AppletPanelVisible", "True").toString() != "True")
+        m_appletPanel->hide();
 
     // ── Status bar (SmartSDR-style, double height) ─────────────────────
     statusBar()->setFixedHeight(40);
@@ -1325,12 +2295,48 @@ void MainWindow::buildUI()
     m_connStatusLabel->hide();
 
     // ── Left section ─────────────────────────────────────────────────────
-    auto* addPanBtn = new QLabel("+PAN");
-    addPanBtn->setStyleSheet("QLabel { color: rgba(255,255,255,128); font-weight: bold; font-size: 24px; }");
-    addPanBtn->setCursor(Qt::PointingHandCursor);
-    addPanBtn->installEventFilter(this);
-    hbox->addWidget(addPanBtn);
-    m_addPanLabel = addPanBtn;
+    // +PAN icon: mini spectrum with + overlay
+    {
+        QPixmap pm(36, 28);
+        pm.fill(Qt::transparent);
+        QPainter pp(&pm);
+        pp.setRenderHint(QPainter::Antialiasing);
+        // Spectrum line — flat noise floor with two signal peaks
+        pp.setPen(QPen(QColor(255, 255, 255, 128), 1.8));
+        const QPointF pts[] = {
+            {0,22}, {4,21}, {7,20}, {9,14}, {10,7}, {11,14}, {13,20},
+            {16,21}, {18,20}, {20,10}, {21,4}, {22,10}, {24,20},
+            {27,21}, {30,22}
+        };
+        pp.drawPolyline(pts, 15);
+        // + sign in upper-right
+        pp.setPen(QPen(QColor(255, 255, 255, 200), 2.2));
+        pp.drawLine(30, 4, 30, 14);   // vertical
+        pp.drawLine(25, 9, 35, 9);    // horizontal
+        pp.end();
+        auto* addPanBtn = new QLabel;
+        addPanBtn->setPixmap(pm);
+        addPanBtn->setCursor(Qt::PointingHandCursor);
+        addPanBtn->setToolTip("Add Panadapter");
+        addPanBtn->installEventFilter(this);
+        hbox->addWidget(addPanBtn);
+        m_addPanLabel = addPanBtn;
+    }
+
+    hbox->addSpacing(8);
+
+    bool panelVis = AppSettings::instance().value("AppletPanelVisible", "True").toString() == "True";
+    m_panelToggle = new QLabel(QString::fromUtf8("\xe2\x98\xb0"));  // ☰ hamburger
+    m_panelToggle->setStyleSheet(panelVis
+        ? "QLabel { color: rgba(255,255,255,128); font-weight: bold; font-size: 22px; }"
+        : "QLabel { color: #404858; font-weight: bold; font-size: 22px; }");
+    m_panelToggle->setAlignment(Qt::AlignBottom);
+    m_panelToggle->setCursor(Qt::PointingHandCursor);
+    m_panelToggle->setToolTip("Toggle applet panel");
+    m_panelToggle->installEventFilter(this);
+    hbox->addWidget(m_panelToggle);
+
+    hbox->addSpacing(8);
 
     m_tnfIndicator = new QLabel("TNF");
     m_tnfIndicator->setStyleSheet("QLabel { color: rgba(255,255,255,128); font-weight: bold; font-size: 24px; }");
@@ -1340,10 +2346,16 @@ void MainWindow::buildUI()
 
     m_cwxIndicator = new QLabel("CWX");
     m_cwxIndicator->setStyleSheet(greyIndLg);
+    m_cwxIndicator->setCursor(Qt::PointingHandCursor);
+    m_cwxIndicator->setToolTip("CW Keyer — click to toggle");
+    m_cwxIndicator->installEventFilter(this);
     hbox->addWidget(m_cwxIndicator);
 
     m_dvkIndicator = new QLabel("DVK");
     m_dvkIndicator->setStyleSheet(greyIndLg);
+    m_dvkIndicator->setCursor(Qt::PointingHandCursor);
+    m_dvkIndicator->setToolTip("Digital Voice Keyer — click to toggle");
+    m_dvkIndicator->installEventFilter(this);
     hbox->addWidget(m_dvkIndicator);
 
     m_fdxIndicator = new QLabel("FDX");
@@ -1578,6 +2590,13 @@ void MainWindow::onConnectionStateChanged(bool connected)
         // Auto-hide the connection dialog on successful connect
         m_connPanel->hide();
 
+        // Close reconnect dialog if it was showing
+        if (m_reconnectDlg) {
+            m_reconnectDlg->close();
+            m_reconnectDlg->deleteLater();
+            m_reconnectDlg = nullptr;
+        }
+
         // Auto-start 4-channel rigctld TCP servers if enabled
         auto& as = AppSettings::instance();
         if (as.value("AutoStartRigctld", "False").toString() == "True") {
@@ -1634,7 +2653,55 @@ void MainWindow::onConnectionStateChanged(bool connected)
             });
         }
 #endif
+        // Auto-connect DX cluster if enabled
+        {
+            auto& cs = AppSettings::instance();
+            if (cs.value("DxClusterAutoConnect", "False").toString() == "True") {
+                QString host = cs.value("DxClusterHost", "dxc.nc7j.com").toString();
+                quint16 cPort = static_cast<quint16>(cs.value("DxClusterPort", 7300).toInt());
+                QString call = cs.value("DxClusterCallsign").toString();
+                if (!call.isEmpty() && !m_dxCluster->isConnected())
+                    QMetaObject::invokeMethod(m_dxCluster, [=] { m_dxCluster->connectToCluster(host, cPort, call); });
+            }
+            // Auto-connect RBN if enabled
+            if (cs.value("RbnAutoConnect", "False").toString() == "True") {
+                QString host = cs.value("RbnHost", "telnet.reversebeacon.net").toString();
+                quint16 rPort = static_cast<quint16>(cs.value("RbnPort", 7000).toInt());
+                QString call = cs.value("RbnCallsign").toString();
+                if (call.isEmpty())
+                    call = cs.value("DxClusterCallsign").toString();
+                if (!call.isEmpty() && !m_rbnClient->isConnected())
+                    QMetaObject::invokeMethod(m_rbnClient, [=] { m_rbnClient->connectToCluster(host, rPort, call); });
+            }
+            // Auto-start WSJT-X listener if enabled
+            if (cs.value("WsjtxAutoStart", "False").toString() == "True") {
+                QString wAddr = cs.value("WsjtxAddress", "224.0.0.1").toString();
+                quint16 wPort = static_cast<quint16>(cs.value("WsjtxPort", 2237).toInt());
+                if (!m_wsjtxClient->isListening())
+                    QMetaObject::invokeMethod(m_wsjtxClient, [=] { m_wsjtxClient->startListening(wAddr, wPort); });
+            }
+            // Auto-start POTA polling if enabled
+            if (cs.value("PotaAutoStart", "False").toString() == "True") {
+                int pInterval = cs.value("PotaPollInterval", 30).toInt();
+                if (!m_potaClient->isPolling())
+                    QMetaObject::invokeMethod(m_potaClient, [=] { m_potaClient->startPolling(pInterval); });
+            }
+#ifdef HAVE_WEBSOCKETS
+            // Auto-start FreeDV Reporter if enabled
+            if (cs.value("FreeDvAutoStart", "False").toString() == "True") {
+                if (!m_freedvClient->isConnected())
+                    QMetaObject::invokeMethod(m_freedvClient, [this] { m_freedvClient->startConnection(); });
+            }
+#endif
+        }
     } else {
+        QMetaObject::invokeMethod(m_dxCluster, [=] { m_dxCluster->disconnect(); });
+        QMetaObject::invokeMethod(m_rbnClient, [=] { m_rbnClient->disconnect(); });
+        QMetaObject::invokeMethod(m_wsjtxClient, [=] { m_wsjtxClient->stopListening(); });
+        QMetaObject::invokeMethod(m_potaClient, [=] { m_potaClient->stopPolling(); });
+#ifdef HAVE_WEBSOCKETS
+        QMetaObject::invokeMethod(m_freedvClient, [this] { m_freedvClient->stopConnection(); });
+#endif
         m_connStatusLabel->setText("Disconnected");
         m_radioInfoLabel->setText("");
         m_radioVersionLabel->setText("");
@@ -1650,6 +2717,41 @@ void MainWindow::onConnectionStateChanged(bool connected)
 #endif
         m_audio.stopRxStream();
         m_audio.stopTxStream();
+
+        // Show reconnect dialog on unexpected disconnect (only one at a time)
+        if (!m_userDisconnected && !m_reconnectDlg) {
+            m_reconnectDlg = new QDialog(this);
+            m_reconnectDlg->setWindowTitle("Radio Disconnected");
+            m_reconnectDlg->setModal(false);
+            m_reconnectDlg->setFixedSize(400, 150);
+            m_reconnectDlg->setStyleSheet(
+                "QDialog { background: #0f0f1a; border: 2px solid #205070; }"
+                "QLabel { color: #c8d8e8; font-size: 14px; }"
+                "QPushButton { background: #1a3a5a; border: 1px solid #205070; "
+                "border-radius: 3px; color: #c8d8e8; font-size: 12px; "
+                "font-weight: bold; padding: 6px 20px; }"
+                "QPushButton:hover { background: #204060; }");
+            auto* layout = new QVBoxLayout(m_reconnectDlg);
+            layout->setAlignment(Qt::AlignCenter);
+            auto* label = new QLabel("Radio disconnected\nWaiting for reconnect...");
+            label->setAlignment(Qt::AlignCenter);
+            layout->addWidget(label);
+            auto* dismissBtn = new QPushButton("Disconnect");
+            dismissBtn->setFixedWidth(120);
+            layout->addWidget(dismissBtn, 0, Qt::AlignCenter);
+            connect(dismissBtn, &QPushButton::clicked, this, [this]() {
+                m_userDisconnected = true;
+                m_reconnectDlg->close();
+                m_reconnectDlg->deleteLater();
+                m_reconnectDlg = nullptr;
+                auto& s = AppSettings::instance();
+                s.remove("LastConnectedRadioSerial");
+                s.remove("LastRoutedRadioIp");
+                s.save();
+                m_connPanel->show();
+            });
+            m_reconnectDlg->show();
+        }
     }
 }
 
@@ -1662,6 +2764,9 @@ void MainWindow::onConnectionError(const QString& msg)
 
 void MainWindow::onSliceAdded(SliceModel* s)
 {
+    // During layout transition, spectrums are being destroyed/recreated — skip
+    if (m_applyingLayout) return;
+
     qDebug() << "MainWindow: slice added" << s->sliceId();
 
     // First slice — wire everything up
@@ -1672,10 +2777,13 @@ void MainWindow::onSliceAdded(SliceModel* s)
         if (m_bandSettings.currentBand().isEmpty())
             m_bandSettings.setCurrentBand(BandSettings::bandForFrequency(s->frequency()));
 
-        // Re-create audio stream if it was invalidated by a profile load
+        // Re-create audio stream if it was invalidated by a profile load.
+        // Only create if PC Audio is enabled — if the user is listening
+        // through the radio's hardware outputs, don't switch to PC. (#336)
         if (m_needAudioStream) {
             m_needAudioStream = false;
-            m_radioModel.createAudioStream();
+            if (AppSettings::instance().value("PcAudioEnabled", "True").toString() == "True")
+                m_radioModel.createRxAudioStream();
         }
 
         // Restore saved DAX channel from last session
@@ -1688,9 +2796,23 @@ void MainWindow::onSliceAdded(SliceModel* s)
         QTimer::singleShot(500, this, [this]() {
             auto& settings = AppSettings::instance();
             if (settings.value("ClientNr2Enabled", "False").toString() == "True")
-                m_audio.setNr2Enabled(true);
+                enableNr2WithWisdom();
             else if (settings.value("ClientRn2Enabled", "False").toString() == "True")
                 m_audio.setRn2Enabled(true);
+            // BNR not auto-restored — requires manual enable each session
+
+            // Deferred CW decoder restart after profile load (#305).
+            // Mode status arrives asynchronously — by the time setActiveSlice
+            // runs, the slice may still have its default mode (not CW).
+            // Re-check after status has settled.
+            auto* sl = activeSlice();
+            if (sl) {
+                bool isCw = (sl->mode() == "CW" || sl->mode() == "CWL");
+                bool decodeOn = settings.value("CwDecodeOverlay", "True").toString() == "True";
+                if (m_panApplet) m_panApplet->setCwPanelVisible(isCw && decodeOn);
+                if (isCw && !m_cwDecoder.isRunning())
+                    m_cwDecoder.start();
+            }
         });
     }
 
@@ -1705,8 +2827,10 @@ void MainWindow::onSliceAdded(SliceModel* s)
     // Digital modes (DIGU/DIGL/RTTY) use DAX bridge; voice modes use mic.
     auto updateDaxTxMode = [this]() {
         bool isDigital = false;
+        int txSliceId = -1;
         for (auto* sl : m_radioModel.slices()) {
             if (sl->isTxSlice()) {
+                txSliceId = sl->sliceId();
                 const QString& m = sl->mode();
                 isDigital = (m == "DIGU" || m == "DIGL" || m == "RTTY"
                           || m == "DFM"  || m == "NFM");
@@ -1714,6 +2838,13 @@ void MainWindow::onSliceAdded(SliceModel* s)
             }
         }
         m_audio.setDaxTxMode(isDigital);
+#ifdef HAVE_RADE
+        // RADE mode should only route mic→RADEEngine when the TX slice IS
+        // the RADE slice.  Otherwise a RADE slice running on a non-TX slice
+        // would hijack voice TX on the actual TX slice.
+        if (m_radeSliceId >= 0 && m_radeEngine && m_radeEngine->isActive())
+            m_audio.setRadeMode(txSliceId == m_radeSliceId);
+#endif
     };
     connect(s, &SliceModel::modeChanged, this, updateDaxTxMode);
     connect(s, &SliceModel::txSliceChanged, this, updateDaxTxMode);
@@ -1722,6 +2853,13 @@ void MainWindow::onSliceAdded(SliceModel* s)
 
     // Push overlay for this slice to the spectrum widget
     pushSliceOverlay(s);
+
+    // Set the panadapter applet's slice label (e.g. "Slice B") based on
+    // which pan this slice belongs to
+    if (m_panStack && !s->panId().isEmpty()) {
+        if (auto* applet = m_panStack->panadapter(s->panId()))
+            applet->setSliceId(s->sliceId());
+    }
 
     // Set initial hasTxSlice for waterfall freeze logic
     if (s->isTxSlice())
@@ -1776,8 +2914,12 @@ void MainWindow::onSliceAdded(SliceModel* s)
 
     // When the radio notifies us that this slice became active, switch to it
     connect(s, &SliceModel::activeChanged, this, [this, s](bool active) {
-        if (active)
-            setActiveSlice(s->sliceId());
+        if (!active) return;
+        // Accept radio's active echo — update client state but use
+        // m_updatingFromModel to prevent sending active=1 back (feedback loop).
+        m_updatingFromModel = true;
+        setActiveSlice(s->sliceId());
+        m_updatingFromModel = false;
     });
 
     // Update filter limits when the active slice's mode changes
@@ -1792,11 +2934,14 @@ void MainWindow::onSliceAdded(SliceModel* s)
         if (s->sliceId() == m_activeSliceId) {
             bool isCw = (mode == "CW" || mode == "CWL");
             bool decodeOn = AppSettings::instance().value("CwDecodeOverlay", "True").toString() == "True";
-            m_panApplet->setCwPanelVisible(isCw && decodeOn);
+            if (m_panApplet) m_panApplet->setCwPanelVisible(isCw && decodeOn);
             if (isCw && !m_cwDecoder.isRunning())
                 m_cwDecoder.start();
             else if (!isCw && m_cwDecoder.isRunning())
                 m_cwDecoder.stop();
+
+            // Update CWX/DVK indicator availability for new mode
+            updateKeyerAvailability(mode);
         }
     });
 
@@ -1828,10 +2973,8 @@ void MainWindow::onSliceAdded(SliceModel* s)
 
     wireVfoWidget(vfo, s);
 
-    // Wire active VFO signals (NR2, RN2, RADE) — these may have been
-    // missed during setActiveSlice if the VFO didn't exist yet
-    if (s->sliceId() == m_activeSliceId)
-        wireActiveVfoSignals(vfo);
+    // NR2/RN2/RADE are now wired permanently in wireVfoWidget — no
+    // special handling needed here for active slice timing.
 
     // Show DIV button on dual-SCU radios
     {
@@ -1847,6 +2990,12 @@ void MainWindow::onSliceAdded(SliceModel* s)
             vfo, [vfo, sid](int sliceIndex, float dbm) {
         if (sliceIndex == sid)
             vfo->setSignalLevel(dbm);
+    });
+    // Feed ESC meter per-slice — signal strength after ESC processing
+    connect(m_radioModel.meterModel(), &MeterModel::escLevelChanged,
+            vfo, [vfo, sid](int sliceIndex, float dbm) {
+        if (sliceIndex == sid)
+            vfo->setEscLevel(dbm);
     });
     connect(&m_radioModel, &RadioModel::antListChanged,
             vfo, &VfoWidget::setAntennaList);
@@ -1902,7 +3051,15 @@ void MainWindow::onSliceAdded(SliceModel* s)
 
 void MainWindow::onSliceRemoved(int id)
 {
+    if (m_applyingLayout) return;
+
     qDebug() << "MainWindow: slice removed" << id;
+
+#ifdef HAVE_RADE
+    // If the RADE slice was closed, deactivate RADE
+    if (id == m_radeSliceId)
+        deactivateRADE();
+#endif
 
     // If the split TX slice was closed, disable split
     if (m_splitActive && id == m_splitTxSliceId) {
@@ -1925,9 +3082,28 @@ void MainWindow::onSliceRemoved(int id)
             }
         }
     }
-    // Fallback: also clean the active/default spectrum
-    spectrum()->removeSliceOverlay(id);
-    spectrum()->removeVfoWidget(id);
+    // Clean slice overlay and VFO widget from all spectrums
+    for (auto* a : m_panStack->allApplets()) {
+        a->spectrumWidget()->removeSliceOverlay(id);
+        a->spectrumWidget()->removeVfoWidget(id);
+    }
+
+    // Update pan title bars — show the first remaining slice on each pan,
+    // or clear the title if the pan has no slices left.
+    if (m_panStack) {
+        for (auto* applet : m_panStack->allApplets()) {
+            bool found = false;
+            for (auto* sl : m_radioModel.slices()) {
+                if (sl->panId() == applet->panId()) {
+                    applet->setSliceId(sl->sliceId());
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+                applet->clearSliceTitle();
+        }
+    }
 
     // Reset panadapter state so display settings re-sync after profile load
     m_radioModel.resetPanState();
@@ -1964,8 +3140,11 @@ void MainWindow::setActiveSlice(int sliceId)
     const int prevId = m_activeSliceId;
     m_activeSliceId = sliceId;
 
-    // Tell the radio this slice is now active (don't move TX — user controls that)
-    if (sliceId != prevId)
+    // Send "slice set N active=1" only when switching to a different slice
+    // (matches SmartSDR pcap — sent on VFO flag click, not on every tune).
+    // Guard: don't send if triggered by the radio's own activeChanged echo
+    // (m_updatingFromModel is set in the activeChanged handler).
+    if (sliceId != prevId && !m_updatingFromModel)
         s->setActive(true);
 
     // Update all overlay isActive flags on each slice's correct spectrum
@@ -1987,17 +3166,15 @@ void MainWindow::setActiveSlice(int sliceId)
     m_appletPanel->setSlice(s);
     spectrum()->overlayMenu()->setSlice(s);
 
-    // Switch active VFO widget — disconnect global signals from old, connect to new
-    if (auto* prevVfo = spectrum()->vfoWidget()) {
-        disconnect(prevVfo, &VfoWidget::nr2Toggled, this, nullptr);
-        disconnect(prevVfo, &VfoWidget::rn2Toggled, this, nullptr);
-#ifdef HAVE_RADE
-        disconnect(prevVfo, &VfoWidget::radeActivated, this, nullptr);
-#endif
+    // Sync step size from the new active slice
+    if (s->stepHz() > 0) {
+        if (spectrum()) spectrum()->setStepSize(s->stepHz());
+        m_appletPanel->rxApplet()->syncStepFromSlice(s->stepHz(), s->stepList());
     }
+
+    // Switch active VFO widget display (NR2/RN2/RADE are wired permanently
+    // in wireVfoWidget, no disconnect/reconnect needed)
     spectrum()->setActiveVfoWidget(sliceId);
-    if (auto* vfo = spectrum()->vfoWidget())
-        wireActiveVfoSignals(vfo);
 
     // Update filter limits for the active slice's mode
     updateFilterLimitsForMode(s->mode());
@@ -2005,25 +3182,23 @@ void MainWindow::setActiveSlice(int sliceId)
     // Show/hide CW decode panel for the active slice's current mode
     bool isCw = (s->mode() == "CW" || s->mode() == "CWL");
     bool decodeOn = AppSettings::instance().value("CwDecodeOverlay", "True").toString() == "True";
-    m_panApplet->setCwPanelVisible(isCw && decodeOn);
+    if (m_panApplet) m_panApplet->setCwPanelVisible(isCw && decodeOn);
     if (isCw && !m_cwDecoder.isRunning())
         m_cwDecoder.start();
     else if (!isCw && m_cwDecoder.isRunning())
         m_cwDecoder.stop();
+
+    // Update CWX/DVK indicator availability for this slice's mode
+    updateKeyerAvailability(s->mode());
 
     // Detect band from frequency
     if (m_bandSettings.currentBand().isEmpty())
         m_bandSettings.setCurrentBand(BandSettings::bandForFrequency(s->frequency()));
 
 
-#ifdef HAVE_RADE
-    // Switch RADE audio mode based on whether the active slice is the RADE slice.
-    // When on the RADE slice: mic → RADEEngine, speaker blocked (muted at slice level).
-    // When on a non-RADE slice: mic → normal VITA-49, speaker plays normally.
-    if (m_radeSliceId >= 0 && m_radeEngine && m_radeEngine->isActive()) {
-        m_audio.setRadeMode(sliceId == m_radeSliceId);
-    }
-#endif
+    // NOTE: RADE audio mode is now driven by the TX slice (in updateDaxTxMode),
+    // not the active/selected slice. Switching which slice the user is looking at
+    // should not change the TX audio routing.
 
     updateSplitState();
 
@@ -2049,7 +3224,10 @@ void MainWindow::updateFilterLimitsForMode(const QString& mode)
 
 void MainWindow::pushSliceOverlay(SliceModel* s)
 {
-    spectrumForSlice(s)->setSliceOverlay(s->sliceId(), s->frequency(),
+    if (m_applyingLayout) return;
+    auto* sw = spectrumForSlice(s);
+    if (!sw) return;
+    sw->setSliceOverlay(s->sliceId(), s->frequency(),
         s->filterLow(), s->filterHigh(), s->isTxSlice(),
         s->sliceId() == m_activeSliceId,
         s->mode(), s->rttyMark(), s->rttyShift(),
@@ -2093,35 +3271,108 @@ void MainWindow::updateSplitState()
 // OverlayMenu signals to RadioModel, TnfModel, and MainWindow handlers.
 // In multi-pan mode (Phase 6+), called for each new panadapter.
 
+void MainWindow::setActivePanApplet(PanadapterApplet* applet)
+{
+    if (applet == m_panApplet) return;
+
+    // Disconnect CW decoder from old applet (QPointer guards against destroyed widget)
+    if (m_panApplet) {
+        disconnect(&m_cwDecoder, &CwDecoder::textDecoded,
+                   m_panApplet, &PanadapterApplet::appendCwText);
+        disconnect(&m_cwDecoder, &CwDecoder::statsUpdated,
+                   m_panApplet, &PanadapterApplet::setCwStats);
+        if (auto* pb = m_panApplet->lockPitchButton())
+            disconnect(pb, &QPushButton::toggled,
+                       &m_cwDecoder, &CwDecoder::lockPitch);
+        if (auto* sb = m_panApplet->lockSpeedButton())
+            disconnect(sb, &QPushButton::toggled,
+                       &m_cwDecoder, &CwDecoder::lockSpeed);
+        disconnect(m_panApplet, &PanadapterApplet::pitchRangeChanged,
+                   &m_cwDecoder, &CwDecoder::setPitchRange);
+    }
+
+    m_panApplet = applet;
+
+    // Reconnect CW decoder to new applet
+    if (m_panApplet) {
+        connect(&m_cwDecoder, &CwDecoder::textDecoded,
+                m_panApplet, &PanadapterApplet::appendCwText);
+        connect(&m_cwDecoder, &CwDecoder::statsUpdated,
+                m_panApplet, &PanadapterApplet::setCwStats);
+        connect(m_panApplet->lockPitchButton(), &QPushButton::toggled,
+                &m_cwDecoder, &CwDecoder::lockPitch);
+        connect(m_panApplet->lockSpeedButton(), &QPushButton::toggled,
+                &m_cwDecoder, &CwDecoder::lockSpeed);
+        connect(m_panApplet, &PanadapterApplet::pitchRangeChanged,
+                &m_cwDecoder, &CwDecoder::setPitchRange);
+    }
+}
+
 void MainWindow::wirePanadapter(PanadapterApplet* applet)
 {
     auto* sw = applet->spectrumWidget();
     auto* menu = sw->overlayMenu();
 
+    // Set panId on the overlay menu so +RX routes to the correct pan
+    menu->setPanId(applet->panId());
+
     // ── Pan activation: clicking on this pan makes it active ─────────────
     connect(applet, &PanadapterApplet::activated,
             m_panStack, &PanadapterStack::setActivePan);
 
-    // ── User drag actions from spectrum → RadioModel ──────────────────────
+    // ── Close pan: X button on title bar closes this pan ────────────────
+    connect(applet, &PanadapterApplet::closeRequested,
+            this, [this](const QString& panId) {
+        // Don't close the last pan
+        if (m_panStack->count() <= 1) return;
+        m_radioModel.sendCommand(QString("display pan remove %1").arg(panId));
+    });
+
+    // ── User drag actions from spectrum → radio (per-pan) ──────────────────
     connect(sw, &SpectrumWidget::bandwidthChangeRequested,
-            &m_radioModel, &RadioModel::setPanBandwidth);
+            this, [this, applet](double bw) {
+        m_radioModel.sendCommand(
+            QString("display pan set %1 bandwidth=%2").arg(applet->panId()).arg(bw, 0, 'f', 6));
+    });
     connect(sw, &SpectrumWidget::centerChangeRequested,
-            &m_radioModel, &RadioModel::setPanCenter);
+            this, [this, applet](double center) {
+        m_radioModel.sendCommand(
+            QString("display pan set %1 center=%2").arg(applet->panId()).arg(center, 0, 'f', 6));
+    });
+    connect(sw, &SpectrumWidget::bandZoomRequested,
+            this, [this, applet]() {
+        m_radioModel.sendCommand(
+            QString("display pan set %1 band_zoom=1").arg(applet->panId()));
+    });
+    connect(sw, &SpectrumWidget::segmentZoomRequested,
+            this, [this, applet]() {
+        m_radioModel.sendCommand(
+            QString("display pan set %1 segment_zoom=1").arg(applet->panId()));
+    });
     connect(sw, &SpectrumWidget::filterChangeRequested,
             this, [this](int lo, int hi) {
         if (auto* s = activeSlice()) s->setFilterWidth(lo, hi);
     });
     connect(sw, &SpectrumWidget::dbmRangeChangeRequested,
-            &m_radioModel, &RadioModel::setPanDbmRange);
+            this, [this, applet](float minDbm, float maxDbm) {
+        m_radioModel.sendCommand(
+            QString("display pan set %1 min_dbm=%2 max_dbm=%3")
+                .arg(applet->panId())
+                .arg(static_cast<double>(minDbm), 0, 'f', 2)
+                .arg(static_cast<double>(maxDbm), 0, 'f', 2));
+    });
 
     // ── TNF signals ──────────────────────────────────────────────────────
+    // QPointer guards against dangling sw when a pan is removed (#381)
+    QPointer<SpectrumWidget> swGuard(sw);
     auto* tnf = m_radioModel.tnfModel();
-    auto rebuildTnfMarkers = [this, sw]() {
+    auto rebuildTnfMarkers = [this, swGuard]() {
+        if (!swGuard) return;
         auto* t = m_radioModel.tnfModel();
         QVector<SpectrumWidget::TnfMarker> markers;
         for (const auto& e : t->tnfs())
             markers.append({e.id, e.freqMhz, e.widthHz, e.depthDb, e.permanent});
-        sw->setTnfMarkers(markers);
+        swGuard->setTnfMarkers(markers);
     };
     connect(tnf, &TnfModel::tnfChanged,  this, rebuildTnfMarkers);
     connect(tnf, &TnfModel::tnfRemoved,  this, rebuildTnfMarkers);
@@ -2148,20 +3399,202 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
     connect(sw, &SpectrumWidget::tnfDepthRequested,    tnf, &TnfModel::setTnfDepth);
     connect(sw, &SpectrumWidget::tnfPermanentRequested,tnf, &TnfModel::setTnfPermanent);
 
+    // ── Spot markers ─────────────────────────────────────────────────────
+    auto* spots = m_radioModel.spotModel();
+    auto rebuildSpots = [this, swGuard]() {
+        if (!swGuard) return;  // widget destroyed (layout change)
+        auto* s = m_radioModel.spotModel();
+        QVector<SpectrumWidget::SpotMarker> markers;
+        for (const auto& spot : s->spots()) {
+            QDateTime ts = spot.timestamp;
+            if (!ts.isValid() || ts.toMSecsSinceEpoch() <= 0)
+                ts = QDateTime::fromMSecsSinceEpoch(spot.addedMs, Qt::UTC);
+            markers.append({spot.index, spot.callsign, spot.rxFreqMhz, spot.color, spot.mode,
+                            spot.source, spot.spotterCallsign, spot.comment, ts});
+        }
+        swGuard->setSpotMarkers(markers);
+    };
+    connect(spots, &SpotModel::spotAdded,   this, rebuildSpots);
+    connect(spots, &SpotModel::spotUpdated, this, rebuildSpots);
+    connect(spots, &SpotModel::spotRemoved, this, rebuildSpots);
+    connect(spots, &SpotModel::spotsCleared,this, rebuildSpots);
+    {
+        auto& s = AppSettings::instance();
+        sw->setShowSpots(s.value("IsSpotsEnabled", "True").toString() == "True");
+        sw->setSpotFontSize(s.value("SpotFontSize", "16").toInt());
+        sw->setSpotMaxLevels(s.value("SpotsMaxLevel", "3").toInt());
+        sw->setSpotStartPct(s.value("SpotsStartingHeightPercentage", "50").toInt());
+        sw->setSpotOverrideColors(s.value("IsSpotsOverrideColorsEnabled", "False").toString() == "True");
+    }
+
+    // ── Per-pan display controls (client-side) ───────────────────────────
+    connect(menu, &SpectrumOverlayMenu::fftFillAlphaChanged,
+            sw, &SpectrumWidget::setFftFillAlpha);
+    connect(menu, &SpectrumOverlayMenu::fftFillColorChanged,
+            sw, &SpectrumWidget::setFftFillColor);
+    connect(menu, &SpectrumOverlayMenu::noiseFloorPositionChanged,
+            sw, &SpectrumWidget::setNoiseFloorPosition);
+    connect(menu, &SpectrumOverlayMenu::noiseFloorEnableChanged,
+            sw, &SpectrumWidget::setNoiseFloorEnable);
+
+    // ── DAX IQ pan routing from overlay menu ───────────────────────────
+    // The overlay controls which pan feeds which IQ channel (routing only).
+    // Stream create/destroy and rate are managed by the DIGI applet.
+    connect(menu, &SpectrumOverlayMenu::daxIqChannelChanged,
+            this, [this, applet](int channel) {
+        auto* pan = m_radioModel.panadapter(applet->panId());
+        if (!pan || pan->waterfallId().isEmpty()) return;
+        m_radioModel.sendCommand(
+            QString("display panafall set %1 daxiq_channel=%2")
+                .arg(pan->waterfallId()).arg(channel));
+    });
+
+    // ── Per-pan display controls → radio commands ────────────────────────
+    // Each pan's overlay sends commands with its own panId/wfId, not the
+    // global active pan. This ensures display settings work independently.
+    connect(menu, &SpectrumOverlayMenu::fftAverageChanged,
+            this, [this, applet, sw](int v) {
+        sw->setFftAverage(v);
+        m_radioModel.sendCommand(
+            QString("display pan set %1 average=%2").arg(applet->panId()).arg(v));
+    });
+    connect(menu, &SpectrumOverlayMenu::fftFpsChanged,
+            this, [this, applet, sw](int v) {
+        sw->setFftFps(v);
+        m_radioModel.sendCommand(
+            QString("display pan set %1 fps=%2").arg(applet->panId()).arg(v));
+    });
+    connect(menu, &SpectrumOverlayMenu::fftWeightedAverageChanged,
+            this, [this, applet, sw](bool on) {
+        sw->setFftWeightedAvg(on);
+        m_radioModel.sendCommand(
+            QString("display pan set %1 weighted_average=%2").arg(applet->panId()).arg(on ? 1 : 0));
+    });
+    connect(menu, &SpectrumOverlayMenu::wfColorGainChanged,
+            this, [this, applet, sw](int v) {
+        sw->setWfColorGain(v);
+        auto* pan = m_radioModel.panadapter(applet->panId());
+        if (pan && !pan->waterfallId().isEmpty())
+            m_radioModel.sendCommand(
+                QString("display panafall set %1 color_gain=%2").arg(pan->waterfallId()).arg(v));
+    });
+    connect(menu, &SpectrumOverlayMenu::wfBlackLevelChanged,
+            this, [this, applet, sw](int v) {
+        sw->setWfBlackLevel(v);
+        auto* pan = m_radioModel.panadapter(applet->panId());
+        if (pan && !pan->waterfallId().isEmpty())
+            m_radioModel.sendCommand(
+                QString("display panafall set %1 black_level=%2").arg(pan->waterfallId()).arg(v));
+    });
+    connect(menu, &SpectrumOverlayMenu::wfAutoBlackChanged,
+            this, [this, sw](bool on) {
+        sw->setWfAutoBlack(on);
+    });
+    connect(menu, &SpectrumOverlayMenu::wfLineDurationChanged,
+            this, [this, applet, sw](int ms) {
+        sw->setWfLineDuration(ms);
+        auto* pan = m_radioModel.panadapter(applet->panId());
+        if (pan && !pan->waterfallId().isEmpty())
+            m_radioModel.sendCommand(
+                QString("display panafall set %1 line_duration=%2").arg(pan->waterfallId()).arg(ms));
+    });
+
     // ── Click-to-tune ────────────────────────────────────────────────────
+    // Uses "slice m <freq> pan=<panId>" (matches SmartSDR protocol).
+    // The radio routes the tune to the correct slice for that pan.
     connect(sw, &SpectrumWidget::frequencyClicked,
-            this, [this](double mhz) {
-        // Always tune the active VFO — don't switch slices on click-to-tune.
-        // The user explicitly sets the active VFO by clicking on a VFO widget.
-        onFrequencyChanged(mhz);
+            this, [this, sw](double mhz) {
+        // Find the panId for this spectrum widget
+        QString panId;
+        for (auto* applet : m_panStack->allApplets()) {
+            if (applet->spectrumWidget() == sw) {
+                panId = applet->panId();
+                break;
+            }
+        }
+
+        if (!panId.isEmpty()) {
+            // Check if the active slice is on a DIFFERENT pan — if so, switch
+            // to a slice on the clicked pan. Don't switch when multiple slices
+            // share the same pan (that causes alternating tune targets).
+            auto* curSlice = activeSlice();
+            bool differentPan = curSlice && curSlice->panId() != panId;
+
+            if (differentPan) {
+                for (auto* s : m_radioModel.slices()) {
+                    if (s->panId() == panId) {
+                        setActiveSlice(s->sliceId());
+                        break;
+                    }
+                }
+                m_panStack->setActivePan(panId);
+
+                if (auto* s = activeSlice(); s && !s->isLocked()) {
+                    m_radioModel.sendCommand(
+                        QString("slice m %1 pan=%2").arg(mhz, 0, 'f', 6).arg(panId));
+                    sw->setVfoFrequency(mhz);
+                }
+            } else {
+                onFrequencyChanged(mhz);
+            }
+        } else {
+            onFrequencyChanged(mhz);
+        }
+    });
+
+    // ── Spot trigger — notify the radio when a spot label is clicked (#341)
+    connect(sw, &SpectrumWidget::spotTriggered, this, [this](int spotIndex) {
+        m_radioModel.sendCommand(QString("spot trigger %1").arg(spotIndex));
+    });
+
+    // ── Manual spot add/remove (#36)
+    // Note: wirePanadapter() can be called multiple times for the same widget
+    // (layout changes, reconnect), so disconnect first to avoid duplicate sends.
+    disconnect(sw, &SpectrumWidget::spotAddRequested, this, nullptr);
+    disconnect(sw, &SpectrumWidget::spotRemoveRequested, this, nullptr);
+    connect(sw, &SpectrumWidget::spotAddRequested, this,
+            [this](double freqMhz, const QString& callsign, const QString& comment,
+                   int lifetimeSec, bool forwardToCluster) {
+        auto& as = AppSettings::instance();
+        QString call = QString(callsign).replace(' ', QChar(0x7f));
+        QString freq = QString::number(freqMhz, 'f', 6);
+        QString myCall = as.value("DxClusterCallsign").toString();
+        if (myCall.isEmpty()) myCall = "AetherSDR";
+        QString cmd = "spot add callsign=" + call + " rx_freq=" + freq
+                     + " tx_freq=" + freq
+                     + " source=Manual"
+                     + " spotter_callsign=" + myCall
+                     + " lifetime_seconds=" + QString::number(lifetimeSec);
+        if (!comment.isEmpty())
+            cmd += " comment=" + QString(comment).replace(' ', QChar(0x7f));
+        QString spotColor = as.value("ManualSpotColor", "#00FF00").toString();
+        if (spotColor.length() == 7) spotColor = "#FF" + spotColor.mid(1);
+        cmd += " color=" + spotColor;
+        m_radioModel.sendCommand(cmd);
+
+        // Forward to DX cluster if requested
+        if (forwardToCluster && m_dxCluster && m_dxCluster->isConnected()) {
+            QString dxCmd = QString("DX %1 %2 %3")
+                .arg(freqMhz * 1000.0, 0, 'f', 1)
+                .arg(callsign)
+                .arg(comment);
+            QMetaObject::invokeMethod(m_dxCluster, [this, dxCmd] {
+                m_dxCluster->sendCommand(dxCmd);
+            });
+        }
+    });
+    connect(sw, &SpectrumWidget::spotRemoveRequested, this, [this](int spotIndex) {
+        m_radioModel.sendCommand(QString("spot remove %1").arg(spotIndex));
     });
 
     // ── +RX / +TNF buttons ───────────────────────────────────────────────
     connect(menu, &SpectrumOverlayMenu::addRxClicked,
-            this, [this]() {
+            this, [this](const QString& panId) {
         if (m_radioModel.slices().size() < m_radioModel.maxSlices())
-            m_radioModel.addSlice();
+            m_radioModel.addSliceOnPan(panId);
     });
+    // Disconnect first to avoid duplicate sends on re-wire (#381)
+    disconnect(menu, &SpectrumOverlayMenu::addTnfClicked, this, nullptr);
     connect(menu, &SpectrumOverlayMenu::addTnfClicked,
             this, [this]() {
         auto* s = activeSlice();
@@ -2187,13 +3620,207 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
 
     // ── Band selection ───────────────────────────────────────────────────
     connect(menu, &SpectrumOverlayMenu::bandSelected,
-            this, [this](const QString& bandName, double freqMhz, const QString& mode) {
+            this, [this, applet](const QString& bandName, double freqMhz, const QString& mode) {
+        // Guard against double-fire from multiple pan overlays
+        if (bandName == m_bandSettings.currentBand()) return;
+
         qDebug() << "MainWindow: switching to band" << bandName
                  << "freq:" << freqMhz << "mode:" << mode;
+
+        auto& settings = AppSettings::instance();
+
+        // Find the slice that belongs to THIS pan, not the global active slice
+        SliceModel* s = nullptr;
+        for (auto* sl : m_radioModel.slices()) {
+            if (sl->panId() == applet->panId()) { s = sl; break; }
+        }
+        if (!s) s = activeSlice();  // fallback
+        qDebug() << "BandStack: panId=" << applet->panId()
+                 << "sliceId=" << (s ? s->sliceId() : -1)
+                 << "panCount=" << (m_panStack ? m_panStack->count() : 0);
+
+        // ── Save current band state before switching ──────────────────
+        if (s) {
+            const QString curBand = m_bandSettings.currentBand();
+            if (!curBand.isEmpty()) {
+                const QString pfx = "BandStack_" + curBand + "_";
+                // Only save if the slice's frequency belongs to this band
+                // (prevents cross-band contamination in multi-pan mode)
+                const QString actualBand = BandSettings::bandForFrequency(s->frequency());
+                const bool freqMatchesBand = (actualBand == curBand
+                                              || curBand == "GEN" || curBand == "WWV");
+                if (!freqMatchesBand) {
+                    qDebug() << "BandStack: skipping save — freq" << s->frequency()
+                             << "belongs to" << actualBand << "not" << curBand;
+                } else {
+                settings.setValue(pfx + "Freq",     QString::number(s->frequency(), 'f', 6));
+                settings.setValue(pfx + "Mode",     s->mode());
+                settings.setValue(pfx + "FilterLo", QString::number(s->filterLow()));
+                settings.setValue(pfx + "FilterHi", QString::number(s->filterHigh()));
+                // Step is radio-authoritative (per-slice, per-mode) — not saved in band stack
+                // DSP flags — save each independently
+                settings.setValue(pfx + "NR",   s->nrOn()   ? "True" : "False");
+                settings.setValue(pfx + "NB",   s->nbOn()   ? "True" : "False");
+                settings.setValue(pfx + "ANF",  s->anfOn()  ? "True" : "False");
+                settings.setValue(pfx + "NRL",  s->nrlOn()  ? "True" : "False");
+                settings.setValue(pfx + "NRS",  s->nrsOn()  ? "True" : "False");
+                settings.setValue(pfx + "RNN",  s->rnnOn()  ? "True" : "False");
+                settings.setValue(pfx + "NRF",  s->nrfOn()  ? "True" : "False");
+                settings.setValue(pfx + "ANFL", s->anflOn() ? "True" : "False");
+                settings.setValue(pfx + "ANFT", s->anftOn() ? "True" : "False");
+                settings.setValue(pfx + "APF",  s->apfOn()  ? "True" : "False");
+                // Client-side DSP
+                settings.setValue(pfx + "NR2",  m_audio.nr2Enabled() ? "True" : "False");
+                settings.setValue(pfx + "RN2",  m_audio.rn2Enabled() ? "True" : "False");
+                // BNR not persisted per-band — requires manual enable
+                // AGC
+                settings.setValue(pfx + "AgcMode",      s->agcMode());
+                settings.setValue(pfx + "AgcThreshold",  QString::number(s->agcThreshold()));
+                // Antennas
+                settings.setValue(pfx + "RxAnt", s->rxAntenna());
+                settings.setValue(pfx + "TxAnt", s->txAntenna());
+                // Squelch
+                settings.setValue(pfx + "SqlOn",    s->squelchOn() ? "True" : "False");
+                settings.setValue(pfx + "SqlLevel", QString::number(s->squelchLevel()));
+                // Pan display: bandwidth and dBm scale
+                // Read from SpectrumWidget (client-side truth) not PanadapterModel
+                if (auto* sw = spectrum()) {
+                    float top = sw->refLevel();
+                    float bot = top - sw->dynamicRange();
+                    settings.setValue(pfx + "MinDbm",    QString::number(bot, 'f', 1));
+                    settings.setValue(pfx + "MaxDbm",    QString::number(top, 'f', 1));
+                }
+                // Bandwidth is radio-authoritative — don't save/restore it.
+                // The radio determines pan bandwidth via slice tune / band_zoom.
+                settings.save();
+                qDebug() << "BandStack: saved" << curBand << s->frequency() << s->mode()
+                         << "dBm:" << settings.value(pfx + "MinDbm", "?").toString()
+                         << settings.value(pfx + "MaxDbm", "?").toString();
+                } // end if (freqMatchesBand)
+            }
+        }
+
+        // ── Switch band tracking ──────────────────────────────────────
         m_bandSettings.setCurrentBand(bandName);
-        if (auto* s = activeSlice())
-            s->setMode(mode);
-        onFrequencyChanged(freqMhz);
+
+        // ── Recall saved state or use defaults ────────────────────────
+        const QString pfx = "BandStack_" + bandName + "_";
+        const QString savedFreq = settings.value(pfx + "Freq", "").toString();
+
+        if (!savedFreq.isEmpty() && s) {
+            // Recall saved band state
+            double recallFreq = savedFreq.toDouble();
+            QString recallMode = settings.value(pfx + "Mode", mode).toString();
+
+            s->setMode(recallMode);
+            // Tune this pan's slice and recenter the pan on the new frequency
+            if (m_panStack && m_panStack->count() > 1 && !applet->panId().isEmpty()
+                && applet->panId() != "default") {
+                // slice tune recenters the pan; slice m updates the VFO
+                m_radioModel.sendCommand(
+                    QString("slice tune %1 %2").arg(s->sliceId()).arg(recallFreq, 0, 'f', 6));
+                m_radioModel.sendCommand(
+                    QString("slice m %1 pan=%2").arg(recallFreq, 0, 'f', 6).arg(applet->panId()));
+            } else {
+                // Band change: use tuneAndRecenter to recenter the pan on the
+                // new band. onFrequencyChanged uses autopan=0 which prevents
+                // the radio from scrolling the panadapter to the new frequency.
+                if (s) {
+                    s->tuneAndRecenter(recallFreq);
+                    spectrum()->setVfoFrequency(recallFreq);
+                }
+            }
+            // Filter offsets: let the radio apply the correct default for
+            // the recalled mode. Recalling saved filter widths across mode
+            // changes produces wrong results (e.g. 3kHz USB filter on CW).
+            // Step is radio-authoritative — the radio sends the correct step
+            // for the mode via stepChanged signal, RxApplet syncs automatically.
+
+            // Radio-side DSP flags
+            auto setDsp = [&](const QString& key, const QString& cmd, bool cur) {
+                bool saved = settings.value(pfx + key, cur ? "True" : "False").toString() == "True";
+                if (saved != cur)
+                    m_radioModel.sendCommand(
+                        QString("slice set %1 %2=%3").arg(s->sliceId()).arg(cmd).arg(saved ? 1 : 0));
+            };
+            setDsp("NR",   "nr",   s->nrOn());
+            setDsp("NB",   "nb",   s->nbOn());
+            setDsp("ANF",  "anf",  s->anfOn());
+            setDsp("NRL",  "nrl",  s->nrlOn());
+            setDsp("NRS",  "nrs",  s->nrsOn());
+            setDsp("RNN",  "rnnoise", s->rnnOn());
+            setDsp("NRF",  "nrf",  s->nrfOn());
+            setDsp("ANFL", "anfl", s->anflOn());
+            setDsp("ANFT", "anft", s->anftOn());
+            setDsp("APF",  "apf",  s->apfOn());
+
+            // Client-side DSP
+            bool nr2Saved = settings.value(pfx + "NR2", "False").toString() == "True";
+            bool rn2Saved = settings.value(pfx + "RN2", "False").toString() == "True";
+            // BNR not restored per-band
+            if (nr2Saved != m_audio.nr2Enabled()) m_audio.setNr2Enabled(nr2Saved);
+            if (rn2Saved != m_audio.rn2Enabled()) m_audio.setRn2Enabled(rn2Saved);
+
+            // AGC
+            QString agcMode = settings.value(pfx + "AgcMode", "").toString();
+            int agcThresh   = settings.value(pfx + "AgcThreshold", "-999").toInt();
+            if (!agcMode.isEmpty() && agcMode != s->agcMode())
+                m_radioModel.sendCommand(
+                    QString("slice set %1 agc_mode=%2").arg(s->sliceId()).arg(agcMode));
+            if (agcThresh != -999 && agcThresh != s->agcThreshold())
+                m_radioModel.sendCommand(
+                    QString("slice set %1 agc_threshold=%2").arg(s->sliceId()).arg(agcThresh));
+
+            // Antennas
+            QString rxAnt = settings.value(pfx + "RxAnt", "").toString();
+            QString txAnt = settings.value(pfx + "TxAnt", "").toString();
+            if (!rxAnt.isEmpty() && rxAnt != s->rxAntenna())
+                m_radioModel.sendCommand(
+                    QString("slice set %1 rxant=%2").arg(s->sliceId()).arg(rxAnt));
+            if (!txAnt.isEmpty() && txAnt != s->txAntenna())
+                m_radioModel.sendCommand(
+                    QString("slice set %1 txant=%2").arg(s->sliceId()).arg(txAnt));
+
+            // Squelch
+            bool sqlOn  = settings.value(pfx + "SqlOn", "False").toString() == "True";
+            int sqlLvl  = settings.value(pfx + "SqlLevel", "20").toInt();
+            if (sqlOn != s->squelchOn())
+                m_radioModel.sendCommand(
+                    QString("slice set %1 squelch=%2").arg(s->sliceId()).arg(sqlOn ? 1 : 0));
+            if (sqlLvl != s->squelchLevel())
+                m_radioModel.sendCommand(
+                    QString("slice set %1 squelch_level=%2").arg(s->sliceId()).arg(sqlLvl));
+
+            // Bandwidth is radio-authoritative — only restore dBm scale.
+            float minDbm = settings.value(pfx + "MinDbm", "0").toFloat();
+            float maxDbm = settings.value(pfx + "MaxDbm", "0").toFloat();
+            if (auto* pan = m_radioModel.activePanadapter()) {
+                if (minDbm != 0.0f && maxDbm != 0.0f)
+                    m_radioModel.sendCommand(
+                        QString("display pan set %1 min_dbm=%2 max_dbm=%3")
+                            .arg(pan->panId())
+                            .arg(minDbm, 0, 'f', 1)
+                            .arg(maxDbm, 0, 'f', 1));
+            }
+
+            qDebug() << "BandStack: recalled" << bandName << recallFreq << recallMode;
+        } else {
+            // First time on this band — use static defaults
+            if (s) s->setMode(mode);
+            if (m_panStack && m_panStack->count() > 1 && !applet->panId().isEmpty()
+                && applet->panId() != "default") {
+                m_radioModel.sendCommand(
+                    QString("slice tune %1 %2").arg(s->sliceId()).arg(freqMhz, 0, 'f', 6));
+                m_radioModel.sendCommand(
+                    QString("slice m %1 pan=%2").arg(freqMhz, 0, 'f', 6).arg(applet->panId()));
+            } else {
+                if (s) {
+                    s->tuneAndRecenter(freqMhz);
+                    spectrum()->setVfoFrequency(freqMhz);
+                }
+            }
+            qDebug() << "BandStack: first visit to" << bandName << "using defaults";
+        }
     });
 
     // ── WNB / RF Gain ────────────────────────────────────────────────────
@@ -2227,7 +3854,7 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
             this, [this](bool on) {
         if (on) {
             m_audio.setRn2Enabled(false);
-            m_audio.setNr2Enabled(true);
+            enableNr2WithWisdom();
         } else {
             m_audio.setNr2Enabled(false);
         }
@@ -2242,6 +3869,15 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
             m_audio.setRn2Enabled(false);
         }
         // VFO button sync happens via AudioEngine::rn2EnabledChanged signal
+    });
+    connect(menu, &SpectrumOverlayMenu::bnrToggled,
+            this, [this](bool on) {
+        m_audio.setBnrEnabled(on);
+        // VFO button sync happens via AudioEngine::bnrEnabledChanged signal
+    });
+    connect(menu, &SpectrumOverlayMenu::bnrIntensityChanged,
+            this, [this](float ratio) {
+        m_audio.setBnrIntensity(ratio);
     });
 }
 
@@ -2264,6 +3900,18 @@ void MainWindow::wireVfoWidget(VfoWidget* w, SliceModel* s)
         if (auto* sl = m_radioModel.slice(sliceId))
             sl->setAudioGain(v);
     });
+    // Record/playback
+    connect(w, &VfoWidget::recordToggled, this, [this, sliceId](bool on) {
+        if (auto* sl = m_radioModel.slice(sliceId))
+            sl->setRecordOn(on);
+    });
+    connect(w, &VfoWidget::playToggled, this, [this, sliceId](bool on) {
+        if (auto* sl = m_radioModel.slice(sliceId))
+            sl->setPlayOn(on);
+    });
+    connect(s, &SliceModel::recordOnChanged, w, &VfoWidget::setRecordOn);
+    connect(s, &SliceModel::playOnChanged, w, &VfoWidget::setPlayOn);
+    connect(s, &SliceModel::playEnabledChanged, w, &VfoWidget::setPlayEnabled);
     connect(w, &VfoWidget::autotuneRequested, this, [this, sliceId](bool intermittent) {
         if (m_radioModel.slice(sliceId))
             m_radioModel.cwAutoTune(sliceId, intermittent);
@@ -2287,101 +3935,49 @@ void MainWindow::wireVfoWidget(VfoWidget* w, SliceModel* s)
         tx->setFrequency(rxFreq);
     });
 
-    // Split toggle — per-widget, slice-aware
+    // Split toggle — per-widget, slice-aware (#328)
     connect(w, &VfoWidget::splitToggled, this, [this, sliceId]() {
         if (!m_splitActive) {
             // Entering split: this slice becomes RX, create a new TX slice
             if (m_radioModel.slices().size() >= m_radioModel.maxSlices())
                 return;
+            auto* rxSlice = m_radioModel.slice(sliceId);
+            if (!rxSlice) return;
+
+            // Create TX slice on the SAME pan as the RX slice
+            QString panId = rxSlice->panId();
+            if (panId.isEmpty())
+                panId = m_panStack ? m_panStack->activePanId() : m_radioModel.panId();
+
+            // CW split: offset 1 kHz up (convention). Other modes: 5 kHz up.
+            const QString mode = rxSlice->mode();
+            bool isCw = mode == "CW" || mode == "CWL";
+            double offsetMhz = isCw ? 0.001 : 0.005;
+            double txFreq = rxSlice->frequency() + offsetMhz;
+
             m_splitActive = true;
             m_splitRxSliceId = sliceId;
-            m_radioModel.addSlice();
+            m_radioModel.sendCommand(
+                QString("slice create pan=%1 freq=%2")
+                    .arg(panId).arg(txFreq, 0, 'f', 6));
         } else if (sliceId == m_splitRxSliceId) {
             // Clicking SPLIT on the RX VFO again → disable split, destroy TX slice
             disableSplit();
         }
     });
 
-    // Wire slice data into widget
-    w->setSlice(s);
-    w->setAntennaList(m_radioModel.antennaList());
-    w->setTransmitModel(m_radioModel.transmitModel());
-}
-
-void MainWindow::wireActiveVfoSignals(VfoWidget* w)
-{
-    // PC Audio toggle is now in TitleBar (global, not per-slice).
-    // Split toggle is wired per-widget in wireVfoWidget (slice-aware).
-
-    // NR2 toggle with FFTW wisdom generation
+    // NR2 toggle with FFTW wisdom generation — wired once per VFO, never disconnected
     connect(w, &VfoWidget::nr2Toggled, this, [this](bool on) {
-        if (!on) {
-            m_audio.setNr2Enabled(false);
-            return;
-        }
-        if (AudioEngine::needsWisdomGeneration()) {
-            auto* dlg = new QProgressDialog(
-                "Optimizing FFT plans for NR2...\n\n"
-                "This window will automatically close when wisdom generation is complete.",
-                QString(), 0, 100, this);
-            dlg->setWindowTitle("AetherSDR — FFTW Wisdom");
-            dlg->setWindowModality(Qt::ApplicationModal);
-            dlg->setMinimumDuration(0);
-            dlg->setAutoClose(false);
-            dlg->setAutoReset(false);
-            dlg->setCancelButton(nullptr);
-            dlg->setMinimumWidth(500);
-            dlg->setStyleSheet(
-                "QProgressBar { text-align: center; font-size: 13px;"
-                " font-weight: bold; color: #c8d8e8;"
-                " background: #1a2a3a; border: 1px solid #2e4e6e; border-radius: 3px; }"
-                "QProgressBar::chunk { background: #00b4d8; }");
-            dlg->show();
-
-            auto* breathe = new QPropertyAnimation(dlg, "windowOpacity", dlg);
-            breathe->setDuration(1500);
-            breathe->setStartValue(1.0);
-            breathe->setKeyValueAt(0.5, 0.55);
-            breathe->setEndValue(1.0);
-            breathe->setLoopCount(-1);
-
-            auto* thread = QThread::create([this, dlg, breathe]() {
-                AudioEngine::generateWisdom([dlg, breathe](int step, int total, const std::string& desc) {
-                    int pct = total > 0 ? (step * 100 / total) : 0;
-                    QString d = QString::fromStdString(desc);
-                    QMetaObject::invokeMethod(dlg, [dlg, breathe, pct, d]() {
-                        if (!d.isEmpty()) {
-                            dlg->setLabelText(d + "\n\n"
-                                "This window will automatically close when wisdom generation is complete.");
-                            if (dlg->value() >= 90 && breathe->state() != QAbstractAnimation::Running)
-                                breathe->start();
-                        } else {
-                            dlg->setValue(pct);
-                        }
-                    });
-                });
-            });
-            connect(thread, &QThread::finished, this, [this, dlg, breathe, thread]() {
-                breathe->stop();
-                dlg->setWindowOpacity(1.0);
-                dlg->setValue(100);
-                dlg->setLabelText("Wisdom generation complete!");
-                QTimer::singleShot(800, this, [this, dlg, thread]() {
-                    dlg->close();
-                    dlg->deleteLater();
-                    thread->deleteLater();
-                    m_audio.setNr2Enabled(true);
-                });
-            });
-            thread->start();
-        } else {
-            m_audio.setNr2Enabled(true);
-        }
+        if (!on) { m_audio.setNr2Enabled(false); return; }
+        enableNr2WithWisdom();
     });
 
     // RN2 toggle
     connect(w, &VfoWidget::rn2Toggled, this, [this](bool on) {
         m_audio.setRn2Enabled(on);
+    });
+    connect(w, &VfoWidget::bnrToggled, this, [this](bool on) {
+        m_audio.setBnrEnabled(on);
     });
 
 #ifdef HAVE_RADE
@@ -2389,6 +3985,76 @@ void MainWindow::wireActiveVfoSignals(VfoWidget* w)
         if (on) activateRADE(sliceId); else deactivateRADE();
     });
 #endif
+
+    // Wire slice data into widget
+    w->setSlice(s);
+    w->setAntennaList(m_radioModel.antennaList());
+    w->setTransmitModel(m_radioModel.transmitModel());
+}
+
+// wireActiveVfoSignals removed — NR2/RN2/RADE are now wired permanently
+// in wireVfoWidget() so connections survive focus switches (#227).
+
+void MainWindow::enableNr2WithWisdom()
+{
+    if (AudioEngine::needsWisdomGeneration()) {
+        auto* dlg = new QProgressDialog(
+            "Optimizing FFT plans for NR2...\n\n"
+            "This window will automatically close when wisdom generation is complete.",
+            QString(), 0, 100, this);
+        dlg->setWindowTitle("AetherSDR — FFTW Wisdom");
+        dlg->setWindowModality(Qt::ApplicationModal);
+        dlg->setMinimumDuration(0);
+        dlg->setAutoClose(false);
+        dlg->setAutoReset(false);
+        dlg->setCancelButton(nullptr);
+        dlg->setMinimumWidth(500);
+        dlg->setStyleSheet(
+            "QProgressBar { text-align: center; font-size: 13px;"
+            " font-weight: bold; color: #c8d8e8;"
+            " background: #1a2a3a; border: 1px solid #2e4e6e; border-radius: 3px; }"
+            "QProgressBar::chunk { background: #00b4d8; }");
+        dlg->show();
+
+        auto* breathe = new QPropertyAnimation(dlg, "windowOpacity", dlg);
+        breathe->setDuration(1500);
+        breathe->setStartValue(1.0);
+        breathe->setKeyValueAt(0.5, 0.55);
+        breathe->setEndValue(1.0);
+        breathe->setLoopCount(-1);
+
+        auto* thread = QThread::create([this, dlg, breathe]() {
+            AudioEngine::generateWisdom([dlg, breathe](int step, int total, const std::string& desc) {
+                int pct = total > 0 ? (step * 100 / total) : 0;
+                QString d = QString::fromStdString(desc);
+                QMetaObject::invokeMethod(dlg, [dlg, breathe, pct, d]() {
+                    if (!d.isEmpty()) {
+                        dlg->setLabelText(d + "\n\n"
+                            "This window will automatically close when wisdom generation is complete.");
+                        if (dlg->value() >= 90 && breathe->state() != QAbstractAnimation::Running)
+                            breathe->start();
+                    } else {
+                        dlg->setValue(pct);
+                    }
+                });
+            });
+        });
+        connect(thread, &QThread::finished, this, [this, dlg, breathe, thread]() {
+            breathe->stop();
+            dlg->setWindowOpacity(1.0);
+            dlg->setValue(100);
+            dlg->setLabelText("Wisdom generation complete!");
+            QTimer::singleShot(800, this, [this, dlg, thread]() {
+                dlg->close();
+                dlg->deleteLater();
+                thread->deleteLater();
+                m_audio.setNr2Enabled(true);
+            });
+        });
+        thread->start();
+    } else {
+        m_audio.setNr2Enabled(true);
+    }
 }
 
 SpectrumWidget* MainWindow::spectrum() const
@@ -2406,6 +4072,419 @@ SpectrumWidget* MainWindow::spectrumForSlice(SliceModel* s) const
     return spectrum();  // fallback to active pan
 }
 
+// ─── Pan layout application ───────────────────────────────────────────────────
+
+// ─── Keyboard Shortcuts ───────────────────────────────────────────────────────
+
+void MainWindow::updateKeyerAvailability(const QString& mode)
+{
+    static const QString kActive   = "QLabel { color: #00b4d8; font-weight: bold; font-size: 24px; }";
+    static const QString kAvail    = "QLabel { color: rgba(255,255,255,40); font-weight: bold; font-size: 24px; }";
+    static const QString kDisabled = "QLabel { color: #252530; font-weight: bold; font-size: 24px; }";
+
+    bool isCw  = (mode == "CW" || mode == "CWL");
+    bool isSsb = (mode == "USB" || mode == "LSB" || mode == "AM" || mode == "SAM"
+                  || mode == "FM" || mode == "NFM" || mode == "DFM");
+
+    // CWX: available in CW modes only
+    m_cwxIndicator->setEnabled(isCw);
+    if (!isCw && m_cwxPanel->isVisible()) {
+        m_cwxPanel->hide();
+        m_cwxIndicator->setStyleSheet(kDisabled);
+    } else if (m_cwxPanel->isVisible()) {
+        m_cwxIndicator->setStyleSheet(kActive);
+    } else {
+        m_cwxIndicator->setStyleSheet(isCw ? kAvail : kDisabled);
+    }
+    m_cwxIndicator->setCursor(isCw ? Qt::PointingHandCursor : Qt::ArrowCursor);
+
+    // DVK: available in voice modes (SSB, AM, FM — not DIGU/DIGL)
+    m_dvkIndicator->setEnabled(isSsb);
+    if (!isSsb && m_dvkPanel->isVisible()) {
+        m_dvkPanel->hide();
+        m_dvkIndicator->setStyleSheet(kDisabled);
+    } else if (m_dvkPanel->isVisible()) {
+        m_dvkIndicator->setStyleSheet(kActive);
+    } else {
+        m_dvkIndicator->setStyleSheet(isSsb ? kAvail : kDisabled);
+    }
+    m_dvkIndicator->setCursor(isSsb ? Qt::PointingHandCursor : Qt::ArrowCursor);
+}
+
+void MainWindow::registerShortcutActions()
+{
+    // Helper: nudge active slice frequency by N steps on the active pan
+    auto nudgeFreq = [this](int steps) {
+        if (!m_radioModel.isConnected()) return;
+        auto* s = activeSlice();
+        if (!s || s->isLocked()) return;
+        int stepHz = spectrum() ? spectrum()->stepSize() : 100;
+        double newMhz = s->frequency() + steps * stepHz / 1e6;
+        QString panId = m_panStack ? m_panStack->activePanId() : m_radioModel.panId();
+        if (!panId.isEmpty())
+            m_radioModel.sendCommand(
+                QString("slice m %1 pan=%2").arg(newMhz, 0, 'f', 6).arg(panId));
+        if (spectrum()) spectrum()->setVfoFrequency(newMhz);
+    };
+
+    // Step cycle helper
+    auto cycleStep = [this](int dir) {
+        auto* sw = spectrum();
+        if (!sw) return;
+        static const int steps[] = {10, 50, 100, 250, 500, 1000, 2500, 5000, 10000};
+        int cur = sw->stepSize();
+        if (dir > 0) {
+            for (int i = 0; i < static_cast<int>(std::size(steps)); ++i)
+                if (steps[i] > cur) { sw->setStepSize(steps[i]); return; }
+        } else {
+            for (int i = static_cast<int>(std::size(steps)) - 1; i >= 0; --i)
+                if (steps[i] < cur) { sw->setStepSize(steps[i]); return; }
+        }
+    };
+
+    // ── Frequency ───────────────────────────────────────────────────────
+    m_shortcutManager.registerAction("tune_up_1", "Tune Up (1 step)", "Frequency",
+        QKeySequence(Qt::Key_Right), [nudgeFreq]() { nudgeFreq(1); });
+    m_shortcutManager.registerAction("tune_down_1", "Tune Down (1 step)", "Frequency",
+        QKeySequence(Qt::Key_Left), [nudgeFreq]() { nudgeFreq(-1); });
+    m_shortcutManager.registerAction("tune_up_10", "Tune Up (10 steps)", "Frequency",
+        QKeySequence(Qt::SHIFT | Qt::Key_Right), [nudgeFreq]() { nudgeFreq(10); });
+    m_shortcutManager.registerAction("tune_down_10", "Tune Down (10 steps)", "Frequency",
+        QKeySequence(Qt::SHIFT | Qt::Key_Left), [nudgeFreq]() { nudgeFreq(-10); });
+    m_shortcutManager.registerAction("tune_up_1mhz", "Tune Up 1 MHz", "Frequency",
+        QKeySequence(), [nudgeFreq]() { nudgeFreq(10000); });
+    m_shortcutManager.registerAction("tune_down_1mhz", "Tune Down 1 MHz", "Frequency",
+        QKeySequence(), [nudgeFreq]() { nudgeFreq(-10000); });
+    m_shortcutManager.registerAction("go_to_freq", "Go to Frequency", "Frequency",
+        QKeySequence(Qt::Key_G), [this]() {
+            auto* vfo = spectrum() ? spectrum()->vfoWidget() : nullptr;
+            if (vfo) vfo->beginDirectEntry();
+        });
+
+    // ── Band ────────────────────────────────────────────────────────────
+    struct BandDef { const char* id; const char* name; double mhz; };
+    static const BandDef bands[] = {
+        {"band_160m", "160m", 1.900}, {"band_80m", "80m", 3.800},
+        {"band_60m", "60m", 5.357},   {"band_40m", "40m", 7.200},
+        {"band_30m", "30m", 10.125},  {"band_20m", "20m", 14.225},
+        {"band_17m", "17m", 18.118},  {"band_15m", "15m", 21.300},
+        {"band_12m", "12m", 24.940},  {"band_10m", "10m", 28.400},
+        {"band_6m",  "6m",  50.125},  {"band_2m",  "2m",  146.000},
+    };
+    for (const auto& b : bands) {
+        double freq = b.mhz;
+        m_shortcutManager.registerAction(b.id, b.name, "Band",
+            QKeySequence(), [this, freq]() {
+                if (!m_radioModel.isConnected()) return;
+                auto* s = activeSlice();
+                if (s && !s->isLocked()) s->tuneAndRecenter(freq);
+            });
+    }
+
+    // ── Mode ────────────────────────────────────────────────────────────
+    static const char* modes[] = {"USB", "LSB", "CW", "CWL", "AM", "FM", "DIGU", "DIGL", "RTTY"};
+    for (const char* mode : modes) {
+        QString m = mode;
+        m_shortcutManager.registerAction(
+            QString("mode_%1").arg(m.toLower()), m, "Mode",
+            QKeySequence(), [this, m]() {
+                if (!m_radioModel.isConnected()) return;
+                auto* s = activeSlice();
+                if (s) s->setMode(m);
+            });
+    }
+
+    // ── TX ──────────────────────────────────────────────────────────────
+    m_shortcutManager.registerAction("mox_toggle", "MOX Toggle", "TX",
+        QKeySequence(Qt::Key_T), [this]() {
+            if (!m_radioModel.isConnected()) return;
+            m_radioModel.setTransmit(!m_radioModel.transmitModel()->isTransmitting());
+        });
+    // PTT (Hold) via Space is handled by the app-level event filter
+    // because QShortcut has no "released" signal. Register with null
+    // handler so the keyboard map shows it as bound.
+    m_shortcutManager.registerAction("ptt_hold", "PTT (Hold)", "TX",
+        QKeySequence(Qt::Key_Space), nullptr);
+    m_shortcutManager.registerAction("tune_toggle", "TUNE Toggle", "TX",
+        QKeySequence(), [this]() {
+            if (!m_radioModel.isConnected()) return;
+            bool tuning = m_radioModel.transmitModel()->isTuning();
+            m_radioModel.sendCommand(QString("transmit tune %1").arg(tuning ? 0 : 1));
+        });
+
+    // ── Audio ───────────────────────────────────────────────────────────
+    m_shortcutManager.registerAction("af_gain_up", "AF Gain Up", "Audio",
+        QKeySequence(Qt::Key_Up), [this]() {
+            auto* s = activeSlice();
+            if (s) s->setAudioGain(std::min(100.0f, s->audioGain() + 5.0f));
+        });
+    m_shortcutManager.registerAction("af_gain_down", "AF Gain Down", "Audio",
+        QKeySequence(Qt::Key_Down), [this]() {
+            auto* s = activeSlice();
+            if (s) s->setAudioGain(std::max(0.0f, s->audioGain() - 5.0f));
+        });
+    m_shortcutManager.registerAction("mute_toggle", "Mute Toggle", "Audio",
+        QKeySequence(Qt::Key_M), [this]() {
+            auto* s = activeSlice();
+            if (s) s->setAudioMute(!s->audioMute());
+        });
+
+    // ── Slice ───────────────────────────────────────────────────────────
+    m_shortcutManager.registerAction("next_slice", "Next Slice", "Slice",
+        QKeySequence(), [this]() {
+            const auto& slices = m_radioModel.slices();
+            if (slices.size() <= 1) return;
+            int idx = 0;
+            for (int i = 0; i < slices.size(); ++i)
+                if (slices[i]->sliceId() == m_activeSliceId) { idx = i; break; }
+            setActiveSlice(slices[(idx + 1) % slices.size()]->sliceId());
+        });
+    m_shortcutManager.registerAction("prev_slice", "Prev Slice", "Slice",
+        QKeySequence(), [this]() {
+            const auto& slices = m_radioModel.slices();
+            if (slices.size() <= 1) return;
+            int idx = 0;
+            for (int i = 0; i < slices.size(); ++i)
+                if (slices[i]->sliceId() == m_activeSliceId) { idx = i; break; }
+            setActiveSlice(slices[(idx - 1 + slices.size()) % slices.size()]->sliceId());
+        });
+    m_shortcutManager.registerAction("split_toggle", "Split Toggle", "Slice",
+        QKeySequence(), [this]() {
+            if (!m_splitActive) {
+                if (m_radioModel.slices().size() >= m_radioModel.maxSlices()) return;
+                auto* s = activeSlice();
+                if (!s) return;
+                QString panId = s->panId();
+                if (panId.isEmpty())
+                    panId = m_panStack ? m_panStack->activePanId() : m_radioModel.panId();
+                bool isCw = s->mode() == "CW" || s->mode() == "CWL";
+                double txFreq = s->frequency() + (isCw ? 0.001 : 0.005);
+                m_splitActive = true;
+                m_splitRxSliceId = s->sliceId();
+                m_radioModel.sendCommand(
+                    QString("slice create pan=%1 freq=%2").arg(panId).arg(txFreq, 0, 'f', 6));
+            } else {
+                disableSplit();
+            }
+        });
+
+    // ── Filter ──────────────────────────────────────────────────────────
+    m_shortcutManager.registerAction("filter_widen", "Filter Widen", "Filter",
+        QKeySequence(), [this]() {
+            auto* s = activeSlice();
+            if (!s) return;
+            s->setFilterWidth(s->filterLow(), s->filterHigh() + 100);
+        });
+    m_shortcutManager.registerAction("filter_narrow", "Filter Narrow", "Filter",
+        QKeySequence(), [this]() {
+            auto* s = activeSlice();
+            if (!s) return;
+            s->setFilterWidth(s->filterLow(), std::max(s->filterLow() + 50, s->filterHigh() - 100));
+        });
+
+    // ── Tuning ──────────────────────────────────────────────────────────
+    m_shortcutManager.registerAction("step_up", "Step Size Up", "Tuning",
+        QKeySequence(Qt::Key_BracketRight), [cycleStep]() { cycleStep(1); });
+    m_shortcutManager.registerAction("step_down", "Step Size Down", "Tuning",
+        QKeySequence(Qt::Key_BracketLeft), [cycleStep]() { cycleStep(-1); });
+    m_shortcutManager.registerAction("lock_toggle", "Tune Lock Toggle", "Tuning",
+        QKeySequence(Qt::Key_L), [this]() {
+            auto* s = activeSlice();
+            if (s) s->setLocked(!s->isLocked());
+        });
+
+    // ── DSP ─────────────────────────────────────────────────────────────
+    m_shortcutManager.registerAction("nb_toggle", "NB Toggle", "DSP",
+        QKeySequence(), [this]() {
+            auto* s = activeSlice();
+            if (s) s->setNb(!s->nbOn());
+        });
+    m_shortcutManager.registerAction("nr_cycle", "NR Cycle (Off/NR/NR2)", "DSP",
+        QKeySequence(), [this]() {
+            auto* s = activeSlice();
+            if (!s) return;
+            if (m_audio.nr2Enabled()) {
+                m_audio.setNr2Enabled(false);
+            } else if (s->nrOn()) {
+                s->setNr(false);
+                enableNr2WithWisdom();
+            } else {
+                s->setNr(true);
+            }
+        });
+    m_shortcutManager.registerAction("anf_toggle", "ANF Toggle", "DSP",
+        QKeySequence(), [this]() {
+            auto* s = activeSlice();
+            if (s) s->setAnf(!s->anfOn());
+        });
+
+    // ── AGC ─────────────────────────────────────────────────────────────
+    m_shortcutManager.registerAction("agc_cycle", "AGC Mode Cycle", "AGC",
+        QKeySequence(), [this]() {
+            auto* s = activeSlice();
+            if (!s) return;
+            static const char* modes[] = {"off", "slow", "med", "fast"};
+            QString cur = s->agcMode().toLower();
+            int idx = 0;
+            for (int i = 0; i < 4; ++i)
+                if (cur == modes[i]) { idx = i; break; }
+            s->setAgcMode(modes[(idx + 1) % 4]);
+        });
+
+    // ── Display ─────────────────────────────────────────────────────────
+    m_shortcutManager.registerAction("band_zoom", "Band Zoom", "Display",
+        QKeySequence(), [this]() {
+            if (!m_radioModel.isConnected()) return;
+            auto* s = activeSlice();
+            if (s) m_radioModel.sendCommand(
+                QString("slice set %1 band_zoom=1").arg(s->sliceId()));
+        });
+    m_shortcutManager.registerAction("segment_zoom", "Segment Zoom", "Display",
+        QKeySequence(), [this]() {
+            if (!m_radioModel.isConnected()) return;
+            auto* s = activeSlice();
+            if (s) m_radioModel.sendCommand(
+                QString("slice set %1 segment_zoom=1").arg(s->sliceId()));
+        });
+
+    // ── RIT/XIT ─────────────────────────────────────────────────────────
+    m_shortcutManager.registerAction("rit_toggle", "RIT Toggle", "RIT/XIT",
+        QKeySequence(), [this]() {
+            auto* s = activeSlice();
+            if (s) s->setRit(!s->ritOn(), s->ritFreq());
+        });
+    m_shortcutManager.registerAction("xit_toggle", "XIT Toggle", "RIT/XIT",
+        QKeySequence(), [this]() {
+            auto* s = activeSlice();
+            if (s) s->setXit(!s->xitOn(), s->xitFreq());
+        });
+
+    // ── Load user bindings and create QShortcuts ────────────────────────
+    m_shortcutManager.loadBindings();
+    s_keyboardShortcutsEnabled = m_keyboardShortcutsEnabled;
+    m_shortcutManager.rebuildShortcuts(this, shortcutGuard);
+}
+
+void MainWindow::applyPanLayout(const QString& layoutId)
+{
+    if (!m_radioModel.isConnected()) return;
+
+    static const QMap<QString, int> kPanCounts = {
+        {"1", 1}, {"2v", 2}, {"2h", 2}, {"2h1", 3}, {"12h", 3}, {"3v", 3},
+        {"2x2", 4}, {"4v", 4}
+    };
+    const int needed = kPanCounts.value(layoutId, 1);
+    const int existing = m_panStack->count();
+
+    if (needed < existing) {
+        qDebug() << "applyPanLayout: reducing from" << existing << "to" << needed << "pans";
+
+        // Close extra pans from the end (keep the first N)
+        auto allApplets = m_panStack->allApplets();
+        int toRemove = existing - needed;
+        for (int i = allApplets.size() - 1; i >= 0 && toRemove > 0; --i) {
+            auto* applet = allApplets[i];
+            QString panId = applet->panId();
+            if (panId == "default") continue;
+            qDebug() << "applyPanLayout: closing pan" << panId;
+            m_radioModel.sendCommand(
+                QString("display pan remove %1").arg(panId));
+            // Radio will send "removed" status → panadapterRemoved signal
+            // → PanadapterStack::removePanadapter()
+            --toRemove;
+        }
+
+        // Rearrange remaining pans after a short delay for radio to process
+        QTimer::singleShot(500, this, [this, layoutId]() {
+            m_panStack->rearrangeLayout(layoutId);
+        });
+        return;
+    }
+    if (needed == existing) {
+        // Same count, just rearrange
+        m_panStack->rearrangeLayout(layoutId);
+        return;
+    }
+
+    // Create additional pans to reach the needed count.
+    // Keep existing pan(s) alive — no tear-down, no dangling signals.
+    const int toCreate = needed - existing;
+    auto panIds = std::make_shared<QStringList>();
+
+    // Collect existing pan IDs first (they'll be part of the layout)
+    for (auto* applet : m_panStack->allApplets())
+        panIds->append(applet->panId());
+
+    qDebug() << "applyPanLayout: have" << existing << "pans, creating"
+             << toCreate << "more for layout" << layoutId;
+
+    createPansSequentially(layoutId, toCreate, panIds, 0);
+}
+
+void MainWindow::createPansSequentially(const QString& layoutId, int total,
+                                        std::shared_ptr<QStringList> panIds, int created)
+{
+    if (created >= total) {
+        // All new pans created — wait for radio status to establish PanadapterModels
+        qDebug() << "applyPanLayout: all" << total << "new pans created:" << *panIds;
+        QTimer::singleShot(800, this, [this, panIds, layoutId]() {
+            // The new pans were added to the stack via panadapterAdded handler.
+            // Wire any that aren't already wired.
+            for (auto* applet : m_panStack->allApplets()) {
+                const QString pid = applet->panId();
+                auto* pan = m_radioModel.panadapter(pid);
+                if (pan) {
+                    // Push current state to the spectrum widget
+                    applet->spectrumWidget()->setDbmRange(pan->minDbm(), pan->maxDbm());
+                    applet->spectrumWidget()->setFrequencyRange(
+                        pan->centerMhz(), pan->bandwidthMhz());
+                }
+            }
+
+            // Rearrange splitter structure for the selected layout
+            m_panStack->rearrangeLayout(layoutId);
+
+            m_panApplet = m_panStack->activeApplet();
+
+            qDebug() << "applyPanLayout: layout" << layoutId
+                     << "complete, total pans:" << m_panStack->count();
+        });
+        return;
+    }
+
+    m_radioModel.sendCmdPublic(
+        "display panafall create x=100 y=100",
+        [this, panIds, layoutId, total, created](int code, const QString& body) {
+            if (code != 0) {
+                qWarning() << "applyPanLayout: panafall create failed, code"
+                           << Qt::hex << code << body;
+                return;
+            }
+            const auto kvs = CommandParser::parseKVs(body);
+            QString panId;
+            if (kvs.contains("pan"))       panId = kvs["pan"];
+            else if (kvs.contains("id"))   panId = kvs["id"];
+            else                           panId = body.trimmed();
+
+            qDebug() << "applyPanLayout: created pan" << (created + 1) << "of" << total
+                     << "id:" << panId;
+
+            if (!panId.isEmpty()) {
+                panIds->append(panId);
+                // Configure the pan
+                m_radioModel.sendCommand(
+                    QString("display pan set %1 xpixels=1024 ypixels=700").arg(panId));
+                m_radioModel.sendCommand(
+                    QString("display pan set %1 fps=25").arg(panId));
+            }
+
+            // Create next pan after a brief delay
+            QTimer::singleShot(200, this, [this, layoutId, total, panIds, created]() {
+                createPansSequentially(layoutId, total, panIds, created + 1);
+            });
+        });
+}
+
 // ─── Band settings capture / restore ──────────────────────────────────────────
 
 BandSnapshot MainWindow::captureCurrentBandState() const
@@ -2420,8 +4499,7 @@ BandSnapshot MainWindow::captureCurrentBandState() const
         snap.agcMode       = s->agcMode();
         snap.agcThreshold  = s->agcThreshold();
     }
-    snap.panCenterMhz    = m_radioModel.panCenterMhz();
-    snap.panBandwidthMhz = m_radioModel.panBandwidthMhz();
+    // Center and bandwidth are radio-authoritative — don't capture.
     snap.minDbm          = spectrum()->refLevel() - spectrum()->dynamicRange();
     snap.maxDbm          = spectrum()->refLevel();
     snap.spectrumFrac    = spectrum()->spectrumFrac();
@@ -2435,7 +4513,7 @@ void MainWindow::restoreBandState(const BandSnapshot& snap)
     m_updatingFromModel = true;
     if (auto* s = activeSlice()) {
         s->setMode(snap.mode);
-        s->setFrequency(snap.frequencyMhz);
+        s->tuneAndRecenter(snap.frequencyMhz);
         if (!snap.rxAntenna.isEmpty())
             s->setRxAntenna(snap.rxAntenna);
         s->setFilterWidth(snap.filterLow, snap.filterHigh);
@@ -2443,9 +4521,16 @@ void MainWindow::restoreBandState(const BandSnapshot& snap)
             s->setAgcMode(snap.agcMode);
         s->setAgcThreshold(snap.agcThreshold);
     }
-    m_radioModel.setPanCenter(snap.panCenterMhz);
-    m_radioModel.setPanBandwidth(snap.panBandwidthMhz);
-    m_radioModel.setPanDbmRange(snap.minDbm, snap.maxDbm);
+    if (auto* pan = m_radioModel.activePanadapter()) {
+        // Don't push center or bandwidth — slice tune recenters the pan and
+        // the radio determines bandwidth. Pushing stale saved values causes
+        // FFT/waterfall misalignment during the transition (#279, #291).
+        // Only restore dBm scale (client-side display preference).
+        m_radioModel.sendCommand(
+            QString("display pan set %1 min_dbm=%2 max_dbm=%3").arg(pan->panId())
+                .arg(static_cast<double>(snap.minDbm), 0, 'f', 2)
+                .arg(static_cast<double>(snap.maxDbm), 0, 'f', 2));
+    }
     m_radioModel.setPanRfGain(snap.rfGain);
     m_radioModel.setPanWnb(snap.wnbOn);
     spectrum()->setSpectrumFrac(snap.spectrumFrac);
@@ -2512,6 +4597,11 @@ void MainWindow::activateRADE(int sliceId)
     auto* s = m_radioModel.slice(sliceId);
     if (!s) return;
 
+    // RADE needs to be the TX slice so it can transmit modem audio.
+    // Move TX badge to the RADE slice automatically.
+    if (!s->isTxSlice())
+        s->setTxSlice(true);
+
     // Set radio mode to DIGU/DIGL (passthrough for OFDM modem)
     double freqMhz = s->frequency();
     QString mode = (freqMhz < 10.0) ? "DIGL" : "DIGU";
@@ -2545,7 +4635,9 @@ void MainWindow::activateRADE(int sliceId)
         return;
     }
 
-    m_audio.setRadeMode(true);
+    // Only route mic→RADE when the RADE slice IS the TX slice.
+    // If another slice is TX (e.g. USB voice), leave its audio path alone.
+    m_audio.setRadeMode(s->isTxSlice());
 
     // TX path: mic -> RADEEngine (worker) -> sendModemTxAudio (main)
     connect(&m_audio, &AudioEngine::txRawPcmReady,
@@ -2673,6 +4765,41 @@ void MainWindow::startDax()
     connect(m_radioModel.panStream(), &PanadapterStream::daxAudioReady,
             m_daxBridge, &DaxBridge::feedDaxAudio);
 
+    // ── DAX IQ stream status + VITA routing ─────────────────────────────
+    connect(&m_radioModel, &RadioModel::statusReceived,
+            this, [this](const QString& obj, const QMap<QString,QString>& kvs) {
+        if (!obj.startsWith("stream ")) return;
+        QString type = kvs.value("type");
+        if (type == "dax_iq") {
+            quint32 streamId = obj.mid(7).toUInt(nullptr, 0);
+            if (kvs.contains("removed")) {
+                m_radioModel.panStream()->unregisterIqStream(streamId);
+                m_radioModel.daxIqModel()->handleStreamRemoved(streamId);
+            } else {
+                m_radioModel.daxIqModel()->applyStreamStatus(streamId, kvs);
+                int ch = kvs.value("daxiq_channel").toInt();
+                if (streamId && ch >= 1 && ch <= 4)
+                    m_radioModel.panStream()->registerIqStream(streamId, ch);
+            }
+        }
+    });
+
+    // Route IQ VITA-49 packets to DaxIqModel worker thread
+    connect(m_radioModel.panStream(), &PanadapterStream::iqDataReady,
+            m_radioModel.daxIqModel(), &DaxIqModel::feedRawIqPacket);
+
+    // Wire DAX IQ level meters to DIGI applet
+    connect(m_radioModel.daxIqModel(), &DaxIqModel::iqLevelReady,
+            m_appletPanel->catApplet(), &CatApplet::setDaxIqLevel);
+
+    // Wire DAX IQ enable/disable/rate from DIGI applet to DaxIqModel
+    connect(m_appletPanel->catApplet(), &CatApplet::iqEnableRequested,
+            m_radioModel.daxIqModel(), &DaxIqModel::createStream);
+    connect(m_appletPanel->catApplet(), &CatApplet::iqDisableRequested,
+            m_radioModel.daxIqModel(), &DaxIqModel::removeStream);
+    connect(m_appletPanel->catApplet(), &CatApplet::iqRateChanged,
+            m_radioModel.daxIqModel(), &DaxIqModel::setSampleRate);
+
     // Wire DAX level meters
     connect(m_daxBridge, &DaxBridge::daxRxLevel,
             m_appletPanel->catApplet(), &CatApplet::setDaxRxLevel);
@@ -2691,23 +4818,29 @@ void MainWindow::startDax()
         m_daxBridge->setChannelGain(i, ss.value(QStringLiteral("DaxRxGain%1").arg(i), "0.5").toString().toFloat());
     m_daxBridge->setTxGain(ss.value("DaxTxGain", "0.5").toString().toFloat());
 
-    // Wire DAX TX: apps → bridge → AudioEngine → VITA-49
-    // feedDaxTxAudio blocks only when mic is actively sending (voice TX),
-    // preventing dual-source jitter. During RX and digital TX, DAX flows
-    // freely — this keeps VARAC/WSJT-X pre-PTT audio in the radio's
-    // buffer so TX starts instantly with no delay.
+    // Wire DAX TX: apps → bridge → AudioEngine → VITA-49.
+    // AudioEngine chooses packet format/routing based on DaxTxLowLatency.
     connect(m_daxBridge, &DaxBridge::txAudioReady,
             this, [this](const QByteArray& pcm) {
         if (m_audio.isRadeMode()) return;
+        if (!m_audio.isDaxTxMode()) return;
         m_audio.feedDaxTxAudio(pcm);
     });
 
-    // Save current mic selection and switch to PC + dax=1
+    // Save current TX routing state before forcing PC audio source.
     m_savedMicSelection = m_radioModel.transmitModel()->micSelection();
-    m_radioModel.sendCommand("transmit set mic_selection=PC");
-    m_radioModel.sendCommand("transmit set dax=1");
+    m_savedDaxEnabled = m_radioModel.transmitModel()->daxOn();
 
-    qInfo() << "MainWindow: starting DAX audio bridge";
+    const bool lowLatencyRoute =
+        AppSettings::instance().value("DaxTxLowLatency", "False").toString() == "True";
+    m_audio.setDaxTxUseRadioRoute(!lowLatencyRoute);
+    m_radioModel.sendCommand("transmit set mic_selection=PC");
+    m_radioModel.sendCommand(QString("transmit set dax=%1").arg(lowLatencyRoute ? 0 : 1));
+
+    qInfo() << "MainWindow: starting DAX audio bridge (TX route:"
+            << (lowLatencyRoute ? "low-latency PC mic path, dax=0"
+                                : "radio-native DAX path, dax=1")
+            << ")";
 }
 
 void MainWindow::stopDax()
@@ -2715,11 +4848,15 @@ void MainWindow::stopDax()
     if (!m_daxBridge) return;
 
     m_audio.setDaxTxMode(false);
+    m_audio.clearTxAccumulators();
 
     disconnect(m_radioModel.panStream(), &PanadapterStream::daxAudioReady,
                m_daxBridge, nullptr);
     disconnect(m_daxBridge, &DaxBridge::txAudioReady,
                this, nullptr);
+
+    // Restore previous DAX TX routing state.
+    m_radioModel.sendCommand(QString("transmit set dax=%1").arg(m_savedDaxEnabled ? 1 : 0));
 
     // Restore original mic selection
     if (!m_savedMicSelection.isEmpty() && m_savedMicSelection != "PC")
@@ -2729,6 +4866,264 @@ void MainWindow::stopDax()
     delete m_daxBridge;
     m_daxBridge = nullptr;
     qInfo() << "MainWindow: stopping DAX audio bridge";
+}
+#endif
+
+#ifdef HAVE_MIDI
+void MainWindow::registerMidiParams()
+{
+    using P = MidiParamType;
+    auto reg = [this](const char* id, const char* name, const char* cat,
+                      MidiParamType type, float lo, float hi,
+                      std::function<void(float)> setter,
+                      std::function<float()> getter = {}) {
+        m_midiControl.registerParam({id, name, cat, type, lo, hi, std::move(setter), std::move(getter)});
+    };
+
+    // ── RX ──────────────────────────────────────────────────────────────
+    reg("rx.afGain", "AF Gain", "RX", P::Slider, 0, 200,
+        [this](float v) { if (auto* s = activeSlice()) s->setAudioGain(v); },
+        [this]() -> float { auto* s = activeSlice(); return s ? s->audioGain() : 0; });
+
+    reg("rx.squelch", "Squelch Level", "RX", P::Slider, 0, 100,
+        [this](float v) { if (auto* s = activeSlice()) s->setSquelch(s->squelchOn(), static_cast<int>(v)); },
+        [this]() -> float { auto* s = activeSlice(); return s ? s->squelchLevel() : 0; });
+
+    reg("rx.agcThreshold", "AGC Threshold", "RX", P::Slider, 0, 100,
+        [this](float v) { if (auto* s = activeSlice()) s->setAgcThreshold(static_cast<int>(v)); },
+        [this]() -> float { auto* s = activeSlice(); return s ? s->agcThreshold() : 0; });
+
+    reg("rx.audioPan", "Audio Pan", "RX", P::Slider, 0, 100,
+        [this](float v) { if (auto* s = activeSlice()) s->setAudioPan(static_cast<int>(v)); },
+        [this]() -> float { auto* s = activeSlice(); return s ? s->audioPan() : 50; });
+
+    reg("rx.nbEnable", "Noise Blanker", "RX", P::Toggle, 0, 1,
+        [this](float v) { if (auto* s = activeSlice()) s->setNb(v > 0.5f); },
+        [this]() -> float { auto* s = activeSlice(); return s && s->nbOn() ? 1 : 0; });
+
+    reg("rx.nrEnable", "Noise Reduction", "RX", P::Toggle, 0, 1,
+        [this](float v) { if (auto* s = activeSlice()) s->setNr(v > 0.5f); },
+        [this]() -> float { auto* s = activeSlice(); return s && s->nrOn() ? 1 : 0; });
+
+    reg("rx.anfEnable", "Auto Notch", "RX", P::Toggle, 0, 1,
+        [this](float v) { if (auto* s = activeSlice()) s->setAnf(v > 0.5f); },
+        [this]() -> float { auto* s = activeSlice(); return s && s->anfOn() ? 1 : 0; });
+
+    reg("rx.squelchEnable", "Squelch Enable", "RX", P::Toggle, 0, 1,
+        [this](float v) { if (auto* s = activeSlice()) s->setSquelch(v > 0.5f, s->squelchLevel()); },
+        [this]() -> float { auto* s = activeSlice(); return s && s->squelchOn() ? 1 : 0; });
+
+    reg("rx.mute", "Audio Mute", "RX", P::Toggle, 0, 1,
+        [this](float v) { m_audio.setMuted(v > 0.5f); },
+        [this]() -> float { return m_audio.isMuted() ? 1 : 0; });
+
+    reg("rx.tuneLock", "Tune Lock", "RX", P::Toggle, 0, 1,
+        [this](float v) { if (auto* s = activeSlice()) s->setLocked(v > 0.5f); },
+        [this]() -> float { auto* s = activeSlice(); return s && s->isLocked() ? 1 : 0; });
+
+    reg("rx.ritEnable", "RIT Enable", "RX", P::Toggle, 0, 1,
+        [this](float v) { if (auto* s = activeSlice()) s->setRit(v > 0.5f, s->ritFreq()); },
+        [this]() -> float { auto* s = activeSlice(); return s && s->ritOn() ? 1 : 0; });
+
+    reg("rx.xitEnable", "XIT Enable", "RX", P::Toggle, 0, 1,
+        [this](float v) { if (auto* s = activeSlice()) s->setXit(v > 0.5f, s->xitFreq()); },
+        [this]() -> float { auto* s = activeSlice(); return s && s->xitOn() ? 1 : 0; });
+
+    reg("rx.nr2Enable", "NR2 (Spectral)", "RX", P::Toggle, 0, 1,
+        [this](float v) { m_audio.setNr2Enabled(v > 0.5f); },
+        [this]() -> float { return m_audio.nr2Enabled() ? 1 : 0; });
+
+    reg("rx.rn2Enable", "RN2 (RNNoise)", "RX", P::Toggle, 0, 1,
+        [this](float v) { m_audio.setRn2Enabled(v > 0.5f); },
+        [this]() -> float { return m_audio.rn2Enabled() ? 1 : 0; });
+
+    reg("rx.stepUp", "Step Size Up", "RX", P::Trigger, 0, 1,
+        [this](float) { if (auto* rx = m_appletPanel->rxApplet()) rx->cycleStepUp(); });
+
+    reg("rx.stepDown", "Step Size Down", "RX", P::Trigger, 0, 1,
+        [this](float) { if (auto* rx = m_appletPanel->rxApplet()) rx->cycleStepDown(); });
+
+    reg("rx.tuneKnob", "Tune Up/Down", "RX", P::Slider, 0, 127,
+        [this](float v) {
+            // Relative tuning: center = 64 (no change), < 64 = down, > 64 = up
+            auto* s = activeSlice();
+            if (!s || s->isLocked()) return;
+            int steps = static_cast<int>(v) - 64;
+            if (steps == 0) return;
+            int stepHz = spectrum() ? spectrum()->stepSize() : 100;
+            double newMhz = s->frequency() + steps * stepHz / 1e6;
+            QString panId = m_panStack ? m_panStack->activePanId() : m_radioModel.panId();
+            if (!panId.isEmpty())
+                m_radioModel.sendCommand(
+                    QString("slice m %1 pan=%2").arg(newMhz, 0, 'f', 6).arg(panId));
+            if (spectrum()) spectrum()->setVfoFrequency(newMhz);
+        });
+
+    // ── TX ──────────────────────────────────────────────────────────────
+    reg("tx.rfPower", "RF Power", "TX", P::Slider, 0, 100,
+        [this](float v) { m_radioModel.transmitModel()->setRfPower(static_cast<int>(v)); },
+        [this]() -> float { return m_radioModel.transmitModel()->rfPower(); });
+
+    reg("tx.tunePower", "Tune Power", "TX", P::Slider, 0, 100,
+        [this](float v) { m_radioModel.transmitModel()->setTunePower(static_cast<int>(v)); },
+        [this]() -> float { return m_radioModel.transmitModel()->tunePower(); });
+
+    reg("tx.mox", "MOX", "TX", P::Toggle, 0, 1,
+        [this](float v) { m_radioModel.setTransmit(v > 0.5f); },
+        [this]() -> float { return m_radioModel.transmitModel()->isMox() ? 1 : 0; });
+
+    reg("tx.tune", "TUNE", "TX", P::Toggle, 0, 1,
+        [this](float v) {
+            m_radioModel.sendCommand(QString("transmit tune %1").arg(v > 0.5f ? 1 : 0));
+        },
+        [this]() -> float { return m_radioModel.transmitModel()->isTuning() ? 1 : 0; });
+
+    reg("tx.atuStart", "ATU Start", "TX", P::Trigger, 0, 1,
+        [this](float) { m_radioModel.sendCommand("atu start"); });
+
+    // ── Phone/CW ────────────────────────────────────────────────────────
+    reg("phone.micLevel", "Mic Level", "Phone/CW", P::Slider, 0, 100,
+        [this](float v) { m_radioModel.transmitModel()->setMicLevel(static_cast<int>(v)); },
+        [this]() -> float { return m_radioModel.transmitModel()->micLevel(); });
+
+    reg("phone.monGain", "Monitor Volume", "Phone/CW", P::Slider, 0, 100,
+        [this](float v) { m_radioModel.transmitModel()->setMonGainSb(static_cast<int>(v)); },
+        [this]() -> float { return m_radioModel.transmitModel()->monGainSb(); });
+
+    reg("phone.procEnable", "Speech Processor", "Phone/CW", P::Toggle, 0, 1,
+        [this](float v) { m_radioModel.transmitModel()->setSpeechProcessorEnable(v > 0.5f); },
+        [this]() -> float { return m_radioModel.transmitModel()->speechProcessorEnable() ? 1 : 0; });
+
+    reg("phone.daxEnable", "DAX", "Phone/CW", P::Toggle, 0, 1,
+        [this](float v) { m_radioModel.transmitModel()->setDax(v > 0.5f); },
+        [this]() -> float { return m_radioModel.transmitModel()->daxOn() ? 1 : 0; });
+
+    reg("phone.monEnable", "Monitor", "Phone/CW", P::Toggle, 0, 1,
+        [this](float v) { m_radioModel.transmitModel()->setSbMonitor(v > 0.5f); },
+        [this]() -> float { return m_radioModel.transmitModel()->sbMonitor() ? 1 : 0; });
+
+    reg("phone.voxEnable", "VOX Enable", "Phone/CW", P::Toggle, 0, 1,
+        [this](float v) { m_radioModel.transmitModel()->setVoxEnable(v > 0.5f); },
+        [this]() -> float { return m_radioModel.transmitModel()->voxEnable() ? 1 : 0; });
+
+    reg("phone.voxLevel", "VOX Level", "Phone/CW", P::Slider, 0, 100,
+        [this](float v) { m_radioModel.transmitModel()->setVoxLevel(static_cast<int>(v)); },
+        [this]() -> float { return m_radioModel.transmitModel()->voxLevel(); });
+
+    reg("phone.amCarrier", "AM Carrier", "Phone/CW", P::Slider, 0, 100,
+        [this](float v) { m_radioModel.transmitModel()->setAmCarrierLevel(static_cast<int>(v)); },
+        [this]() -> float { return m_radioModel.transmitModel()->amCarrierLevel(); });
+
+    reg("cw.speed", "CW Speed", "Phone/CW", P::Slider, 5, 100,
+        [this](float v) { m_radioModel.transmitModel()->setCwSpeed(static_cast<int>(v)); },
+        [this]() -> float { return m_radioModel.transmitModel()->cwSpeed(); });
+
+    reg("cw.key", "CW Key (straight)", "Phone/CW", P::Gate, 0, 1,
+        [this](float v) { m_radioModel.sendCwKey(v > 0.5f); });
+
+    // Iambic paddle: dit and dah are separate MIDI notes.
+    // The radio handles iambic A/B mode and timing — we just send both states.
+    {
+        auto dit = std::make_shared<bool>(false);
+        auto dah = std::make_shared<bool>(false);
+
+        reg("cw.dit", "CW Paddle Dit", "Phone/CW", P::Gate, 0, 1,
+            [this, dit, dah](float v) {
+                *dit = (v > 0.5f);
+                m_radioModel.sendCwPaddle(*dit, *dah);
+            },
+            [dit]() -> float { return *dit ? 1.0f : 0.0f; });
+
+        reg("cw.dah", "CW Paddle Dah", "Phone/CW", P::Gate, 0, 1,
+            [this, dit, dah](float v) {
+                *dah = (v > 0.5f);
+                m_radioModel.sendCwPaddle(*dit, *dah);
+            },
+            [dah]() -> float { return *dah ? 1.0f : 0.0f; });
+    }
+
+    reg("cw.ptt", "PTT (hold)", "Phone/CW", P::Gate, 0, 1,
+        [this](float v) { m_radioModel.setTransmit(v > 0.5f); });
+
+    // ── EQ ──────────────────────────────────────────────────────────────
+    reg("eq.txEnable", "TX EQ Enable", "EQ", P::Toggle, 0, 1,
+        [this](float v) { m_radioModel.equalizerModel()->setTxEnabled(v > 0.5f); },
+        [this]() -> float { return m_radioModel.equalizerModel()->txEnabled() ? 1 : 0; });
+
+    reg("eq.rxEnable", "RX EQ Enable", "EQ", P::Toggle, 0, 1,
+        [this](float v) { m_radioModel.equalizerModel()->setRxEnabled(v > 0.5f); },
+        [this]() -> float { return m_radioModel.equalizerModel()->rxEnabled() ? 1 : 0; });
+
+    {
+        using B = EqualizerModel::Band;
+        static const B bands[] = {B::B63, B::B125, B::B250, B::B500, B::B1k, B::B2k, B::B4k, B::B8k};
+        static const int freqs[] = {63, 125, 250, 500, 1000, 2000, 4000, 8000};
+        static const char* names[] = {"63 Hz", "125 Hz", "250 Hz", "500 Hz",
+                                       "1 kHz", "2 kHz", "4 kHz", "8 kHz"};
+        for (int i = 0; i < 8; ++i) {
+            B band = bands[i];
+            QString id = QString("eq.band%1").arg(freqs[i]);
+            reg(id.toUtf8().constData(), names[i], "EQ", P::Slider, -10, 10,
+                [this, band](float v) { m_radioModel.equalizerModel()->setTxBand(band, static_cast<int>(v)); },
+                [this, band]() -> float { return m_radioModel.equalizerModel()->txBand(band); });
+        }
+    }
+
+    // ── Global ──────────────────────────────────────────────────────────
+    reg("global.masterVolume", "Master Volume", "Global", P::Slider, 0, 100,
+        [this](float v) { m_radioModel.sendCommand(QString("mixer lineout gain %1").arg(static_cast<int>(v))); },
+        [this]() -> float { return m_radioModel.lineoutGain(); });
+
+    reg("global.hpVolume", "Headphone Volume", "Global", P::Slider, 0, 100,
+        [this](float v) { m_radioModel.sendCommand(QString("mixer headphone gain %1").arg(static_cast<int>(v))); },
+        [this]() -> float { return m_radioModel.headphoneGain(); });
+
+    reg("global.masterMute", "Master Mute", "Global", P::Toggle, 0, 1,
+        [this](float v) { m_audio.setMuted(v > 0.5f); },
+        [this]() -> float { return m_audio.isMuted() ? 1 : 0; });
+
+    reg("global.txButton", "TX Button", "Global", P::Toggle, 0, 1,
+        [this](float v) { m_radioModel.setTransmit(v > 0.5f); },
+        [this]() -> float { return m_radioModel.transmitModel()->isMox() ? 1 : 0; });
+
+    reg("global.tnfEnable", "TNF Global", "Global", P::Toggle, 0, 1,
+        [this](float v) { m_radioModel.sendCommand(QString("radio set tnf_enabled=%1").arg(v > 0.5f ? 1 : 0)); });
+
+    reg("global.bandUp", "Band Up", "Global", P::Trigger, 0, 1,
+        [this](float) {
+            // Placeholder — band cycling requires overlay menu integration
+            qDebug() << "MIDI: Band Up triggered";
+        });
+
+    reg("global.bandDown", "Band Down", "Global", P::Trigger, 0, 1,
+        [this](float) {
+            qDebug() << "MIDI: Band Down triggered";
+        });
+
+    reg("global.nextSlice", "Next Slice", "Global", P::Trigger, 0, 1,
+        [this](float) {
+            const auto& slices = m_radioModel.slices();
+            if (slices.size() > 1) {
+                int idx = 0;
+                for (int i = 0; i < slices.size(); ++i) {
+                    if (slices[i]->sliceId() == m_activeSliceId) { idx = i; break; }
+                }
+                setActiveSlice(slices[(idx + 1) % slices.size()]->sliceId());
+            }
+        });
+
+    reg("global.prevSlice", "Previous Slice", "Global", P::Trigger, 0, 1,
+        [this](float) {
+            const auto& slices = m_radioModel.slices();
+            if (slices.size() > 1) {
+                int idx = 0;
+                for (int i = 0; i < slices.size(); ++i) {
+                    if (slices[i]->sliceId() == m_activeSliceId) { idx = i; break; }
+                }
+                int prev = (idx - 1 + slices.size()) % slices.size();
+                setActiveSlice(slices[prev]->sliceId());
+            }
+        });
 }
 #endif
 

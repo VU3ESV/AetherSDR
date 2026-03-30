@@ -1,4 +1,5 @@
 #include "VfoWidget.h"
+#include "PhaseKnob.h"
 #include "ComboStyle.h"
 #include "SliceColors.h"
 #include "models/SliceModel.h"
@@ -7,6 +8,7 @@
 
 #include <QPainter>
 #include <QPushButton>
+#include <QTimer>
 #include <QLabel>
 #include <QSlider>
 #include <QLineEdit>
@@ -24,6 +26,36 @@
 #include <QEvent>
 #include <QMouseEvent>
 #include <cmath>
+
+// Horizontal level meter bar: maps a dBm value to a filled bar.
+// Range: -130 (empty) to -20 dBm (full). Color: cyan with green tint above S9.
+class LevelBar : public QWidget {
+public:
+    explicit LevelBar(const float& valueRef, QWidget* parent = nullptr)
+        : QWidget(parent), m_value(valueRef) {}
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, false);
+        // Background
+        p.fillRect(rect(), QColor(0x10, 0x10, 0x1c));
+        // Border
+        p.setPen(QColor(0x30, 0x40, 0x50));
+        p.drawRect(rect().adjusted(0, 0, -1, -1));
+        // Fill: map -130...-20 dBm to 0...1
+        constexpr float lo = -130.0f, hi = -20.0f;
+        float frac = std::clamp((m_value - lo) / (hi - lo), 0.0f, 1.0f);
+        int fillW = static_cast<int>(frac * (width() - 2));
+        if (fillW > 0) {
+            // Cyan below S9 (-73 dBm), green above
+            QColor color = (m_value < -73.0f) ? QColor(0x00, 0xb4, 0xd8)
+                                               : QColor(0x00, 0xd8, 0x60);
+            p.fillRect(1, 1, fillW, height() - 2, color);
+        }
+    }
+private:
+    const float& m_value;
+};
 
 // Slider that resets to a default value on double-click.
 class ResetSlider : public QSlider {
@@ -130,7 +162,9 @@ static const QString kModeBtn =
 
 static const QString kSliderStyle =
     "QSlider::groove:horizontal { background: #1a2a3a; height: 4px; border-radius: 2px; }"
-    "QSlider::handle:horizontal { background: #c8d8e8; width: 12px; margin: -4px 0; border-radius: 6px; }";
+    "QSlider::handle:horizontal { background: #c8d8e8; width: 12px; margin: -4px 0; border-radius: 6px; }"
+    "QSlider::groove:vertical { background: #1a2a3a; width: 4px; border-radius: 2px; }"
+    "QSlider::handle:vertical { background: #c8d8e8; height: 12px; margin: 0 -4px; border-radius: 6px; }";
 
 static const QString kLabelStyle =
     "QLabel { background: transparent; border: none; color: #8aa8c0; font-size: 13px; }";
@@ -141,7 +175,8 @@ VfoWidget::VfoWidget(QWidget* parent)
     : QWidget(parent)
 {
     setObjectName("VfoWidgetRoot");
-    setFixedWidth(WIDGET_W);
+    setMinimumWidth(WIDGET_W);
+    setMaximumWidth(WIDGET_W);
     setAttribute(Qt::WA_TransparentForMouseEvents, false);
     setAttribute(Qt::WA_TranslucentBackground);
     setAutoFillBackground(false);
@@ -170,6 +205,8 @@ VfoWidget::~VfoWidget()
     // target is deleted, preventing double-free.
     delete m_closeSliceBtn.data();
     delete m_lockVfoBtn.data();
+    delete m_recordBtn.data();
+    delete m_playBtn.data();
 }
 
 void VfoWidget::buildUI()
@@ -244,8 +281,8 @@ void VfoWidget::buildUI()
     m_txBadge->setFixedSize(28, 20);
     updateTxBadgeStyle(false);
     connect(m_txBadge, &QPushButton::clicked, this, [this] {
-        if (m_slice && !m_slice->isTxSlice())
-            m_slice->setTxSlice(true);
+        if (m_slice)
+            m_slice->setTxSlice(!m_slice->isTxSlice());
     });
     hdr->addWidget(m_txBadge);
 
@@ -297,6 +334,54 @@ void VfoWidget::buildUI()
     connect(m_lockVfoBtn, &QPushButton::toggled, this, [this](bool locked) {
         m_lockVfoBtn->setText(locked ? "\xF0\x9F\x94\x92" : "\xF0\x9F\x94\x93");
         emit lockToggled(locked);
+    });
+
+    // Record button
+    static const QString sliceBtnStyle =
+        "QPushButton { background: rgba(255,255,255,15); border: none; "
+        "border-radius: 10px; font-size: 11px; padding: 0; }"
+        "QPushButton:hover { background: rgba(255,255,255,40); }";
+
+    m_recordBtn = new QPushButton(QString::fromUtf8("\xe2\x8f\xba"), btnParent);  // ⏺
+    m_recordBtn->setFixedSize(20, 20);
+    m_recordBtn->setCheckable(true);
+    m_recordBtn->setToolTip("Record slice audio");
+    m_recordBtn->setStyleSheet(sliceBtnStyle +
+        "QPushButton { color: #804040; }"
+        "QPushButton:checked { color: #ff2020; background: rgba(255,50,50,60); }");
+    m_recordBtn->show();
+    connect(m_recordBtn, &QPushButton::clicked, this, [this](bool checked) {
+        emit recordToggled(checked);
+    });
+
+    // Record pulse animation
+    m_recordPulse = new QTimer(this);
+    m_recordPulse->setInterval(500);
+    connect(m_recordPulse, &QTimer::timeout, this, [this] {
+        if (!m_recordBtn) return;
+        static bool dim = false;
+        dim = !dim;
+        m_recordBtn->setStyleSheet(
+            "QPushButton { background: rgba(255,255,255,15); border: none; "
+            "border-radius: 10px; font-size: 11px; padding: 0; "
+            "color: " + QString(dim ? "#601010" : "#ff2020") + "; "
+            "background: rgba(255,50,50," + QString(dim ? "20" : "60") + "); }"
+            "QPushButton:hover { background: rgba(255,255,255,40); }");
+    });
+
+    // Play button
+    m_playBtn = new QPushButton(QString::fromUtf8("\xe2\x96\xb6"), btnParent);  // ▶
+    m_playBtn->setFixedSize(20, 20);
+    m_playBtn->setCheckable(true);
+    m_playBtn->setEnabled(false);
+    m_playBtn->setToolTip("Play recorded audio");
+    m_playBtn->setStyleSheet(sliceBtnStyle +
+        "QPushButton { color: #406040; }"
+        "QPushButton:checked { color: #30d050; background: rgba(50,200,80,60); }"
+        "QPushButton:disabled { color: #303030; background: rgba(255,255,255,5); }");
+    m_playBtn->show();
+    connect(m_playBtn, &QPushButton::clicked, this, [this](bool checked) {
+        emit playToggled(checked);
     });
 
     // ── Frequency row (right-aligned, double-click to edit) ────────────────
@@ -477,6 +562,48 @@ void VfoWidget::buildTabContent()
         gainRow->addWidget(afVal);
         vb->addLayout(gainRow);
 
+        // SQL row
+        auto* sqlRow = new QHBoxLayout;
+        sqlRow->setSpacing(3);
+        m_sqlBtn = new QPushButton("SQL");
+        m_sqlBtn->setCheckable(true);
+        m_sqlBtn->setFixedHeight(20);
+        m_sqlBtn->setStyleSheet(kDspToggle + kDisabledBtn);
+        sqlRow->addWidget(m_sqlBtn);
+        m_sqlSlider = new QSlider(Qt::Horizontal);
+        m_sqlSlider->setRange(0, 100);
+        m_sqlSlider->setValue(20);
+        m_sqlSlider->setStyleSheet(kSliderStyle);
+        sqlRow->addWidget(m_sqlSlider, 1);
+        auto* sqlVal = new QLabel("20");
+        sqlVal->setStyleSheet(kLabelStyle);
+        sqlVal->setFixedWidth(20);
+        sqlVal->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        sqlRow->addWidget(sqlVal);
+        vb->addLayout(sqlRow);
+
+        // AGC-T row: mode combo + threshold slider
+        auto* agcRow = new QHBoxLayout;
+        agcRow->setSpacing(3);
+        m_agcCmb = new QComboBox;
+        m_agcCmb->addItems({"Off", "Slow", "Med", "Fast"});
+        m_agcCmb->setFixedHeight(20);
+        m_agcCmb->setFixedWidth(60);
+        m_sqlBtn->setFixedWidth(60);  // match AGC combo width
+        AetherSDR::applyComboStyle(m_agcCmb);
+        agcRow->addWidget(m_agcCmb);
+        m_agcTSlider = new QSlider(Qt::Horizontal);
+        m_agcTSlider->setRange(0, 100);
+        m_agcTSlider->setValue(65);
+        m_agcTSlider->setStyleSheet(kSliderStyle);
+        agcRow->addWidget(m_agcTSlider, 1);
+        auto* agcVal = new QLabel("65");
+        agcVal->setStyleSheet(kLabelStyle);
+        agcVal->setFixedWidth(20);
+        agcVal->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        agcRow->addWidget(agcVal);
+        vb->addLayout(agcRow);
+
         // Pan row: DIV button + L + slider (with center marker) + R
         auto* panRow = new QHBoxLayout;
         panRow->setSpacing(3);
@@ -504,6 +631,89 @@ void VfoWidget::buildTabContent()
         panRow->addWidget(panR);
         vb->addLayout(panRow);
 
+        // ESC (Enhanced Signal Clarity) panel — visible only when DIV is active
+        m_escPanel = new QWidget;
+        m_escPanel->setVisible(false);
+        auto* escVbox = new QVBoxLayout(m_escPanel);
+        escVbox->setContentsMargins(0, 0, 0, 2);
+        escVbox->setSpacing(3);
+
+        // ESC toggle + phase slider row
+        auto* escTopRow = new QHBoxLayout;
+        escTopRow->setSpacing(3);
+        m_escBtn = new QPushButton("ESC");
+        m_escBtn->setCheckable(true);
+        m_escBtn->setFixedHeight(20);
+        m_escBtn->setFixedWidth(60);
+        m_escBtn->setStyleSheet(kDspToggle);
+        escTopRow->addWidget(m_escBtn);
+        auto* phaseLbl = new QLabel("P");
+        phaseLbl->setStyleSheet(kLabelStyle);
+        escTopRow->addWidget(phaseLbl);
+        m_escPhaseSlider = new QSlider(Qt::Horizontal);
+        m_escPhaseSlider->setRange(0, 72);   // 0–360° in 5° steps
+        m_escPhaseSlider->setValue(0);
+        m_escPhaseSlider->setStyleSheet(kSliderStyle);
+        escTopRow->addWidget(m_escPhaseSlider, 1);
+        m_escPhaseLbl = new QLabel("0\u00B0");
+        m_escPhaseLbl->setStyleSheet(kLabelStyle);
+        m_escPhaseLbl->setFixedWidth(28);
+        m_escPhaseLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        escTopRow->addWidget(m_escPhaseLbl);
+        escVbox->addLayout(escTopRow);
+
+        // Gain vertical slider + polar plot row
+        auto* escBodyRow = new QHBoxLayout;
+        escBodyRow->setContentsMargins(10, 0, 30, 10);
+        escBodyRow->setSpacing(4);
+
+        // Gain vertical slider + label
+        auto* gainCol = new QVBoxLayout;
+        gainCol->setSpacing(1);
+        m_escGainLbl = new QLabel("1.00");
+        m_escGainLbl->setStyleSheet(kLabelStyle);
+        m_escGainLbl->setAlignment(Qt::AlignHCenter);
+        gainCol->addWidget(m_escGainLbl);
+        m_escGainSlider = new QSlider(Qt::Vertical);
+        m_escGainSlider->setRange(0, 200);   // 0.0 – 2.0
+        m_escGainSlider->setValue(100);       // default 1.0
+        m_escGainSlider->setStyleSheet(kSliderStyle);
+        gainCol->addWidget(m_escGainSlider, 1);
+        auto* gainLbl = new QLabel("G");
+        gainLbl->setStyleSheet(kLabelStyle);
+        gainLbl->setAlignment(Qt::AlignHCenter);
+        gainCol->addWidget(gainLbl);
+        escBodyRow->addLayout(gainCol);
+
+        // Polar plot
+        escBodyRow->addStretch();
+        m_phaseKnob = new PhaseKnob;
+        escBodyRow->addWidget(m_phaseKnob);
+        escVbox->addLayout(escBodyRow);
+
+        // ESC meter row: stretch + "ESC:" + level bar + dBm (right-aligned)
+        auto* escMeterRow = new QHBoxLayout;
+        escMeterRow->setSpacing(4);
+        escMeterRow->setContentsMargins(0, 0, 10, 0);
+        escMeterRow->addStretch();
+        m_escMeterLbl = new QLabel("ESC:");
+        m_escMeterLbl->setStyleSheet(
+            "QLabel { color: #00b4d8; font-size: 11px; font-family: monospace; }");
+        escMeterRow->addWidget(m_escMeterLbl);
+        m_escMeterBar = new LevelBar(m_escLevelDbm);
+        m_escMeterBar->setFixedHeight(8);
+        m_escMeterBar->setFixedWidth(60);
+        escMeterRow->addWidget(m_escMeterBar);
+        m_escDbmLbl = new QLabel("--- dBm");
+        m_escDbmLbl->setStyleSheet(
+            "QLabel { color: #00b4d8; font-size: 11px; font-family: monospace; }");
+        m_escDbmLbl->setAlignment(Qt::AlignRight);
+        escMeterRow->addWidget(m_escDbmLbl);
+        escVbox->addLayout(escMeterRow);
+
+        vb->addWidget(m_escPanel);
+
+        // ── Audio tab connects (all widgets now created) ──
         connect(m_afGainSlider, &QSlider::valueChanged, this, [this, afVal](int v) {
             afVal->setText(QString::number(v));
             if (!m_updatingFromModel) {
@@ -511,39 +721,13 @@ void VfoWidget::buildTabContent()
                 emit afGainChanged(v);
             }
         });
-        connect(m_panSlider, &QSlider::valueChanged, this, [this](int v) {
-            if (!m_updatingFromModel && m_slice) m_slice->setAudioPan(v);
-        });
         connect(m_muteBtn, &QPushButton::toggled, this, [this](bool on) {
             if (!m_updatingFromModel && m_slice) m_slice->setAudioMute(on);
             m_muteBtn->setText(on ? QString::fromUtf8("AF  \xF0\x9F\x94\x87")    // 🔇 AF
                                   : QString::fromUtf8("AF  \xF0\x9F\x94\x8A"));  // 🔊 AF
+            m_tabBtns[0]->setText(on ? QString::fromUtf8("\xF0\x9F\x94\x87")
+                                     : QString::fromUtf8("\xF0\x9F\x94\x8A"));
         });
-        // SQL row
-        auto* sqlRow = new QHBoxLayout;
-        sqlRow->setSpacing(3);
-        m_sqlBtn = new QPushButton("SQL");
-        m_sqlBtn->setCheckable(true);
-        m_sqlBtn->setFixedHeight(20);
-        m_sqlBtn->setStyleSheet(kDspToggle + kDisabledBtn);
-        sqlRow->addWidget(m_sqlBtn);
-        m_sqlSlider = new QSlider(Qt::Horizontal);
-        m_sqlSlider->setRange(0, 100);
-        m_sqlSlider->setValue(20);
-        m_sqlSlider->setStyleSheet(kSliderStyle);
-        sqlRow->addWidget(m_sqlSlider, 1);
-        auto* sqlVal = new QLabel("20");
-        sqlVal->setStyleSheet(kLabelStyle);
-        sqlVal->setFixedWidth(20);
-        sqlVal->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        sqlRow->addWidget(sqlVal);
-        vb->addLayout(sqlRow);
-
-        connect(m_divBtn, &QPushButton::toggled, this, [this](bool on) {
-            if (!m_updatingFromModel && m_slice)
-                m_slice->setDiversity(on);
-        });
-
         connect(m_sqlBtn, &QPushButton::toggled, this, [this](bool on) {
             if (!m_updatingFromModel && m_slice)
                 m_slice->setSquelch(on, m_sqlSlider->value());
@@ -553,32 +737,8 @@ void VfoWidget::buildTabContent()
             if (!m_updatingFromModel && m_slice)
                 m_slice->setSquelch(m_sqlBtn->isChecked(), v);
         });
-
-        // AGC-T row: mode combo + threshold slider
-        auto* agcRow = new QHBoxLayout;
-        agcRow->setSpacing(3);
-        m_agcCmb = new QComboBox;
-        m_agcCmb->addItems({"Off", "Slow", "Med", "Fast"});
-        m_agcCmb->setFixedHeight(20);
-        m_agcCmb->setFixedWidth(60);
-        m_sqlBtn->setFixedWidth(60);  // match AGC combo width
-        AetherSDR::applyComboStyle(m_agcCmb);
-        agcRow->addWidget(m_agcCmb);
-        m_agcTSlider = new QSlider(Qt::Horizontal);
-        m_agcTSlider->setRange(0, 100);
-        m_agcTSlider->setValue(65);
-        m_agcTSlider->setStyleSheet(kSliderStyle);
-        agcRow->addWidget(m_agcTSlider, 1);
-        auto* agcVal = new QLabel("65");
-        agcVal->setStyleSheet(kLabelStyle);
-        agcVal->setFixedWidth(20);
-        agcVal->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        agcRow->addWidget(agcVal);
-        vb->addLayout(agcRow);
-
         connect(m_agcCmb, &QComboBox::currentTextChanged, this, [this](const QString& text) {
             if (!m_updatingFromModel && m_slice) {
-                // Map display text to protocol value
                 QString mode = text.toLower();
                 if (mode == "off") mode = "off";
                 else if (mode == "slow") mode = "slow";
@@ -590,6 +750,35 @@ void VfoWidget::buildTabContent()
         connect(m_agcTSlider, &QSlider::valueChanged, this, [this, agcVal](int v) {
             agcVal->setText(QString::number(v));
             if (!m_updatingFromModel && m_slice) m_slice->setAgcThreshold(v);
+        });
+        connect(m_panSlider, &QSlider::valueChanged, this, [this](int v) {
+            if (!m_updatingFromModel && m_slice) m_slice->setAudioPan(v);
+        });
+        connect(m_divBtn, &QPushButton::toggled, this, [this](bool on) {
+            if (!m_updatingFromModel && m_slice)
+                m_slice->setDiversity(on);
+            // ESC panel only on diversity parent, not child
+            m_escPanel->setVisible(on && m_slice && !m_slice->isDiversityChild());
+            resize(sizeHint());
+        });
+        connect(m_escBtn, &QPushButton::toggled, this, [this](bool on) {
+            if (!m_updatingFromModel && m_slice)
+                m_slice->setEscEnabled(on);
+        });
+        connect(m_escPhaseSlider, &QSlider::valueChanged, this, [this](int v) {
+            int deg = v * 5;  // 5° steps
+            float rad = deg * static_cast<float>(M_PI) / 180.0f;
+            m_escPhaseLbl->setText(QString::number(deg) + QChar(0x00B0));
+            m_phaseKnob->setPhase(rad);
+            if (!m_updatingFromModel && m_slice)
+                m_slice->setEscPhaseShift(rad);
+        });
+        connect(m_escGainSlider, &QSlider::valueChanged, this, [this](int v) {
+            float gain = v / 100.0f;
+            m_escGainLbl->setText(QString::number(gain, 'f', 2));
+            m_phaseKnob->setGain(gain);
+            if (!m_updatingFromModel && m_slice)
+                m_slice->setEscGain(gain);
         });
 
         m_tabStack->addWidget(m_audioTab);
@@ -625,9 +814,13 @@ void VfoWidget::buildTabContent()
         m_nrfBtn  = makeDsp("NRF");
         m_anflBtn = makeDsp("ANFL");
         m_anftBtn = makeDsp("ANFT");
+        m_bnrBtn  = makeDsp("BNR");
         m_apfBtn->hide();  // only visible in CW mode
+#ifndef HAVE_BNR
+        m_bnrBtn->hide();
+#endif
 
-        // Initial layout: 12 buttons in 4/4/4 grid (APF hidden)
+        // Initial layout: 4-column grid (APF hidden, BNR only with HAVE_BNR)
         m_dspGrid->addWidget(m_nrBtn,   0, 0);
         m_dspGrid->addWidget(m_nr2Btn,  0, 1);
         m_dspGrid->addWidget(m_nbBtn,   0, 2);
@@ -639,6 +832,7 @@ void VfoWidget::buildTabContent()
         m_dspGrid->addWidget(m_nrfBtn,  2, 0);
         m_dspGrid->addWidget(m_anflBtn, 2, 1);
         m_dspGrid->addWidget(m_anftBtn, 2, 2);
+        m_dspGrid->addWidget(m_bnrBtn,  2, 3);
         dspVb->addLayout(m_dspGrid);
 
         // APF level slider (hidden unless CW mode)
@@ -948,6 +1142,7 @@ void VfoWidget::buildTabContent()
         connect(m_nrsBtn,  &QPushButton::toggled, this, [this](bool on) { if (!m_updatingFromModel && m_slice) m_slice->setNrs(on); });
         connect(m_rnnBtn,  &QPushButton::toggled, this, [this](bool on) { if (!m_updatingFromModel && m_slice) m_slice->setRnn(on); });
         connect(m_rn2Btn,  &QPushButton::toggled, this, [this](bool on) { if (!m_updatingFromModel) emit rn2Toggled(on); });
+        connect(m_bnrBtn,  &QPushButton::toggled, this, [this](bool on) { if (!m_updatingFromModel) emit bnrToggled(on); });
         connect(m_nrfBtn,  &QPushButton::toggled, this, [this](bool on) { if (!m_updatingFromModel && m_slice) m_slice->setNrf(on); });
         connect(m_anflBtn, &QPushButton::toggled, this, [this](bool on) { if (!m_updatingFromModel && m_slice) m_slice->setAnfl(on); });
         connect(m_anftBtn, &QPushButton::toggled, this, [this](bool on) { if (!m_updatingFromModel && m_slice) m_slice->setAnft(on); });
@@ -1234,6 +1429,20 @@ void VfoWidget::showTab(int index)
 void VfoWidget::setDiversityAllowed(bool allowed)
 {
     if (m_divBtn) m_divBtn->setVisible(allowed);
+    // ESC panel only visible when DIV is active on a dual-SCU radio
+    if (m_escPanel && !allowed) {
+        m_escPanel->setVisible(false);
+        resize(sizeHint());
+    }
+}
+
+void VfoWidget::setEscLevel(float dbm)
+{
+    m_escLevelDbm = dbm;
+    if (m_escDbmLbl)
+        m_escDbmLbl->setText(QString("%1 dBm").arg(dbm, 0, 'f', 0));
+    if (m_escMeterBar)
+        m_escMeterBar->update();
 }
 
 void VfoWidget::setAfGain(int pct)
@@ -1282,7 +1491,7 @@ void VfoWidget::updatePosition(int vfoX, int specTop, FlagDir dir)
 
     move(x, specTop);
 
-    // Position close/lock buttons stacked vertically on the side opposite the marker
+    // Position close/lock/record/play buttons stacked vertically on the side opposite the marker
     if (m_closeSliceBtn && m_lockVfoBtn) {
         const int btnSize = 20;
         const int gap = 2;
@@ -1292,10 +1501,24 @@ void VfoWidget::updatePosition(int vfoX, int specTop, FlagDir dir)
         else
             btnX = x + w + gap;        // right of VFO widget
 
-        m_closeSliceBtn->move(btnX, specTop);
-        m_lockVfoBtn->move(btnX, specTop + btnSize + gap);
+        int btnY = specTop;
+        m_closeSliceBtn->move(btnX, btnY);
         m_closeSliceBtn->raise();
+        btnY += btnSize + gap;
+
+        m_lockVfoBtn->move(btnX, btnY);
         m_lockVfoBtn->raise();
+        btnY += btnSize + gap;
+
+        if (m_recordBtn) {
+            m_recordBtn->move(btnX, btnY);
+            m_recordBtn->raise();
+            btnY += btnSize + gap;
+        }
+        if (m_playBtn) {
+            m_playBtn->move(btnX, btnY);
+            m_playBtn->raise();
+        }
     }
 }
 
@@ -1521,6 +1744,9 @@ void VfoWidget::setSlice(SliceModel* slice)
         m_nbBtn->setVisible(!isFm);
         m_nrlBtn->setVisible(!isFm);
         m_nrsBtn->setVisible(!isFm);
+#ifdef HAVE_BNR
+        m_bnrBtn->setVisible(!isFm);
+#endif
         m_nrfBtn->setVisible(!isFm);
         relayoutDspGrid();
         if (m_tabStack->isVisible()) adjustSize();
@@ -1554,6 +1780,8 @@ void VfoWidget::setSlice(SliceModel* slice)
         m_muteBtn->setChecked(mute);
         m_muteBtn->setText(mute ? QString::fromUtf8("AF  \xF0\x9F\x94\x87")
                                 : QString::fromUtf8("AF  \xF0\x9F\x94\x8A"));
+        m_tabBtns[0]->setText(mute ? QString::fromUtf8("\xF0\x9F\x94\x87")
+                                   : QString::fromUtf8("\xF0\x9F\x94\x8A"));
         m_updatingFromModel = false;
     });
     connect(m_slice, &SliceModel::audioPanChanged, this, [this](int pan) {
@@ -1570,6 +1798,52 @@ void VfoWidget::setSlice(SliceModel* slice)
     connect(m_slice, &SliceModel::diversityChanged, this, [this](bool on) {
         QSignalBlocker sb(m_divBtn);
         m_divBtn->setChecked(on);
+        m_escPanel->setVisible(on && !m_slice->isDiversityChild());
+        resize(sizeHint());
+    });
+    // ESC sync — phase is in radians, display as degrees
+    {
+        QSignalBlocker sb(m_escBtn);
+        m_escBtn->setChecked(m_slice->escEnabled());
+    }
+    {
+        float gain = m_slice->escGain();
+        QSignalBlocker sb(m_escGainSlider);
+        m_escGainSlider->setValue(static_cast<int>(gain * 100.0f));
+        m_escGainLbl->setText(QString::number(gain, 'f', 2));
+        m_phaseKnob->setGain(gain);
+    }
+    {
+        float rad = m_slice->escPhaseShift();
+        int deg = static_cast<int>(rad * 180.0f / M_PI) % 360;
+        QSignalBlocker sb(m_escPhaseSlider);
+        m_escPhaseSlider->setValue(deg / 5);
+        m_escPhaseLbl->setText(QString::number(deg) + QChar(0x00B0));
+        m_phaseKnob->setPhase(rad);
+    }
+    m_escPanel->setVisible(m_slice->diversity() && !m_slice->isDiversityChild());
+    connect(m_slice, &SliceModel::escEnabledChanged, this, [this](bool on) {
+        m_updatingFromModel = true;
+        QSignalBlocker sb(m_escBtn);
+        m_escBtn->setChecked(on);
+        m_updatingFromModel = false;
+    });
+    connect(m_slice, &SliceModel::escGainChanged, this, [this](float gain) {
+        m_updatingFromModel = true;
+        QSignalBlocker sb(m_escGainSlider);
+        m_escGainSlider->setValue(static_cast<int>(gain * 100.0f));
+        m_escGainLbl->setText(QString::number(gain, 'f', 2));
+        m_phaseKnob->setGain(gain);
+        m_updatingFromModel = false;
+    });
+    connect(m_slice, &SliceModel::escPhaseShiftChanged, this, [this](float rad) {
+        m_updatingFromModel = true;
+        int deg = static_cast<int>(rad * 180.0f / M_PI) % 360;
+        QSignalBlocker sb(m_escPhaseSlider);
+        m_escPhaseSlider->setValue(deg / 5);
+        m_escPhaseLbl->setText(QString::number(deg) + QChar(0x00B0));
+        m_phaseKnob->setPhase(rad);
+        m_updatingFromModel = false;
     });
     // DSP toggles
     auto connectDsp = [this](auto signal, QPushButton* btn) {
@@ -1691,6 +1965,11 @@ void VfoWidget::setSlice(SliceModel* slice)
         m_daxCmb->setCurrentIndex(ch);
         m_updatingFromModel = false;
     });
+    connect(m_slice, &SliceModel::lockedChanged, this, [this](bool locked) {
+        QSignalBlocker b(m_lockVfoBtn);
+        m_lockVfoBtn->setChecked(locked);
+        m_lockVfoBtn->setText(locked ? "\xF0\x9F\x94\x92" : "\xF0\x9F\x94\x93");
+    });
 
     syncFromSlice();
 }
@@ -1740,6 +2019,50 @@ void VfoWidget::updateSplitBadge(bool isTxSlice, bool isRxSplit)
     }
 }
 
+void VfoWidget::setRecordOn(bool on)
+{
+    if (m_recordBtn) {
+        QSignalBlocker sb(m_recordBtn);
+        m_recordBtn->setChecked(on);
+    }
+    if (on)
+        m_recordPulse->start();
+    else {
+        m_recordPulse->stop();
+        // Restore normal checked style
+        if (m_recordBtn)
+            m_recordBtn->setStyleSheet(
+                "QPushButton { background: rgba(255,255,255,15); border: none; "
+                "border-radius: 10px; font-size: 11px; padding: 0; color: #804040; }"
+                "QPushButton:checked { color: #ff2020; background: rgba(255,50,50,60); }"
+                "QPushButton:hover { background: rgba(255,255,255,40); }");
+    }
+}
+
+void VfoWidget::setPlayOn(bool on)
+{
+    if (m_playBtn) {
+        QSignalBlocker sb(m_playBtn);
+        m_playBtn->setChecked(on);
+    }
+}
+
+void VfoWidget::setPlayEnabled(bool enabled)
+{
+    if (m_playBtn)
+        m_playBtn->setEnabled(enabled);
+}
+
+void VfoWidget::beginDirectEntry()
+{
+    if (m_slice) {
+        m_freqEdit->setText(QString::number(m_slice->frequency(), 'f', 6));
+        m_freqEdit->selectAll();
+    }
+    m_freqStack->setCurrentIndex(1);
+    m_freqEdit->setFocus();
+}
+
 void VfoWidget::syncFromSlice()
 {
     if (!m_slice) return;
@@ -1778,6 +2101,8 @@ void VfoWidget::syncFromSlice()
         m_muteBtn->setChecked(muted);
         m_muteBtn->setText(muted ? QString::fromUtf8("AF  \xF0\x9F\x94\x87")
                                  : QString::fromUtf8("AF  \xF0\x9F\x94\x8A"));
+        m_tabBtns[0]->setText(muted ? QString::fromUtf8("\xF0\x9F\x94\x87")
+                                    : QString::fromUtf8("\xF0\x9F\x94\x8A"));
     }
     {
         QSignalBlocker b1(m_sqlBtn), b2(m_sqlSlider);
@@ -1796,6 +2121,28 @@ void VfoWidget::syncFromSlice()
         QSignalBlocker sb(m_agcTSlider);
         m_agcTSlider->setValue(m_slice->agcThreshold());
     }
+
+    // ESC (diversity beamforming) — phase in radians, display as degrees
+    {
+        QSignalBlocker sb(m_escBtn);
+        m_escBtn->setChecked(m_slice->escEnabled());
+    }
+    {
+        float gain = m_slice->escGain();
+        QSignalBlocker sb(m_escGainSlider);
+        m_escGainSlider->setValue(static_cast<int>(gain * 100.0f));
+        m_escGainLbl->setText(QString::number(gain, 'f', 2));
+        m_phaseKnob->setGain(gain);
+    }
+    {
+        float rad = m_slice->escPhaseShift();
+        int deg = static_cast<int>(rad * 180.0f / M_PI) % 360;
+        QSignalBlocker sb(m_escPhaseSlider);
+        m_escPhaseSlider->setValue(deg / 5);
+        m_escPhaseLbl->setText(QString::number(deg) + QChar(0x00B0));
+        m_phaseKnob->setPhase(rad);
+    }
+    m_escPanel->setVisible(m_slice->diversity() && !m_slice->isDiversityChild());
 
     // DSP
     auto syncDsp = [](QPushButton* btn, bool on) {
@@ -1839,6 +2186,9 @@ void VfoWidget::syncFromSlice()
     m_nrBtn->setVisible(!isFm);
     m_nr2Btn->setVisible(!isFm);
     m_nbBtn->setVisible(!isFm);
+#ifdef HAVE_BNR
+    m_bnrBtn->setVisible(!isFm);
+#endif
     m_nrlBtn->setVisible(!isFm);
     m_nrsBtn->setVisible(!isFm);
     m_nrfBtn->setVisible(!isFm);
@@ -1908,7 +2258,7 @@ void VfoWidget::relayoutDspGrid()
 {
     // Remove all widgets from the grid (without deleting them)
     QPushButton* all[] = {m_nrBtn, m_nr2Btn, m_nbBtn, m_anfBtn, m_apfBtn, m_nrlBtn,
-                          m_nrsBtn, m_rnnBtn, m_rn2Btn, m_nrfBtn, m_anflBtn, m_anftBtn};
+                          m_nrsBtn, m_rnnBtn, m_rn2Btn, m_nrfBtn, m_anflBtn, m_anftBtn, m_bnrBtn};
     for (auto* btn : all)
         m_dspGrid->removeWidget(btn);
 
@@ -2116,13 +2466,7 @@ bool VfoWidget::eventFilter(QObject* obj, QEvent* event)
 {
     // Double-click on frequency label → open inline edit
     if (obj == m_freqLabel && event->type() == QEvent::MouseButtonDblClick) {
-        // Pre-fill with current frequency in MHz (e.g. "14.225000")
-        if (m_slice) {
-            m_freqEdit->setText(QString::number(m_slice->frequency(), 'f', 6));
-            m_freqEdit->selectAll();
-        }
-        m_freqStack->setCurrentIndex(1);  // show edit
-        m_freqEdit->setFocus();
+        beginDirectEntry();
         return true;
     }
 
@@ -2131,8 +2475,16 @@ bool VfoWidget::eventFilter(QObject* obj, QEvent* event)
         if (lbl) {
             int idx = m_tabBtns.indexOf(lbl);
             if (idx >= 0) {
-                showTab(idx);
-                return true;
+                auto* me = static_cast<QMouseEvent*>(event);
+                // Right-click on speaker tab (idx 0) toggles mute directly
+                if (idx == 0 && me->button() == Qt::RightButton && m_slice) {
+                    m_slice->setAudioMute(!m_slice->audioMute());
+                    return true;
+                }
+                if (me->button() == Qt::LeftButton) {
+                    showTab(idx);
+                    return true;
+                }
             }
         }
     }

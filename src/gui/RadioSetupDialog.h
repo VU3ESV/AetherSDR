@@ -5,6 +5,7 @@
 class QTabWidget;
 class QLabel;
 class QLineEdit;
+class QGroupBox;
 class QProgressBar;
 class QPushButton;
 
@@ -27,6 +28,7 @@ public:
 private:
     QWidget* buildRadioTab();
     QWidget* buildNetworkTab();
+    QGroupBox* buildIpConfigGroup();
     QWidget* buildGpsTab();
     QWidget* buildTxTab();
     QWidget* buildPhoneCwTab();
@@ -34,6 +36,7 @@ private:
     QWidget* buildAudioTab();
     QWidget* buildFiltersTab();
     QWidget* buildXvtrTab();
+    QWidget* buildUsbCablesTab();
 #ifdef HAVE_SERIALPORT
     QWidget* buildSerialTab();
 #endif

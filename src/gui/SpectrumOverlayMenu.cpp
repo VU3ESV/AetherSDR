@@ -107,7 +107,7 @@ SpectrumOverlayMenu::SpectrumOverlayMenu(QWidget* parent)
     // Menu buttons — Band, ANT, DSP handled specially (sub-panels)
     struct BtnDef { QString text; int specialIdx; void (SpectrumOverlayMenu::*sig)(); };
     const BtnDef defs[] = {
-        {"+RX",      -1, &SpectrumOverlayMenu::addRxClicked},   // 0
+        {"+RX",      -1, nullptr},   // 0 — handled separately (signal has panId arg)
         {"+TNF",     -1, &SpectrumOverlayMenu::addTnfClicked},  // 1
         {"Band",      0, nullptr},   // 2 — toggleBandPanel
         {"ANT",       1, nullptr},   // 3 — toggleAntPanel
@@ -128,7 +128,9 @@ SpectrumOverlayMenu::SpectrumOverlayMenu(QWidget* parent)
             connect(btn, &QPushButton::clicked, this, &SpectrumOverlayMenu::toggleDaxPanel);
         else if (def.specialIdx == 4)
             connect(btn, &QPushButton::clicked, this, &SpectrumOverlayMenu::toggleDisplayPanel);
-        else
+        else if (def.text == "+RX")
+            connect(btn, &QPushButton::clicked, this, [this]() { emit addRxClicked(m_panId); });
+        else if (def.sig)
             connect(btn, &QPushButton::clicked, this, def.sig);
         m_menuBtns.append(btn);
     }
@@ -369,6 +371,7 @@ void SpectrumOverlayMenu::setSlice(SliceModel* slice)
         {&S::setNrf,  &S::nrfChanged},   // 8
         {&S::setAnfl, &S::anflChanged},  // 9
         {&S::setAnft, &S::anftChanged},  // 10
+        {nullptr,     nullptr},           // 11 — BNR (client-side, wired separately)
     };
 
     for (int i = 0; i < 11; ++i) {
@@ -439,6 +442,29 @@ void SpectrumOverlayMenu::setSlice(SliceModel* slice)
             emit rn2Toggled(on);
     });
 
+    // BNR (client-side, index 11) — emit signal for MainWindow to handle
+    connect(m_dspRows[11].btn, &QPushButton::toggled, this, [this](bool on) {
+        if (!m_updatingFromModel)
+            emit bnrToggled(on);
+    });
+    if (m_dspRows[11].slider) {
+        m_dspRows[11].slider->setRange(0, 100);
+        m_dspRows[11].slider->setValue(100);  // default: max denoising
+        if (m_dspRows[11].valueLbl)
+            m_dspRows[11].valueLbl->setText("100");
+        connect(m_dspRows[11].slider, &QSlider::valueChanged, this, [this](int v) {
+            if (m_dspRows[11].valueLbl)
+                m_dspRows[11].valueLbl->setText(QString::number(v));
+            if (!m_updatingFromModel)
+                emit bnrIntensityChanged(v / 100.0f);
+        });
+    }
+#ifndef HAVE_BNR
+    m_dspRows[11].btn->setVisible(false);
+    if (m_dspRows[11].slider) m_dspRows[11].slider->setVisible(false);
+    if (m_dspRows[11].valueLbl) m_dspRows[11].valueLbl->setVisible(false);
+#endif
+
     // DAX
     connect(m_slice, &SliceModel::daxChannelChanged, this, [this](int ch) {
         m_updatingFromModel = true;
@@ -497,6 +523,7 @@ void SpectrumOverlayMenu::buildDspPanel()
         {"NRF",  true},   // 8
         {"ANFL", true},   // 9
         {"ANFT", false},  // 10
+        {"BNR",  true},   // 11 — client-side NVIDIA NIM (intensity slider)
     };
 
     for (const auto& def : defs) {
@@ -620,6 +647,23 @@ void SpectrumOverlayMenu::buildDaxPanel()
             this, [this](int idx) {
         if (!m_updatingFromModel && m_slice)
             m_slice->setDaxChannel(idx);
+    });
+
+    auto* iqRow = new QHBoxLayout;
+    iqRow->setSpacing(4);
+    auto* iqLbl = new QLabel("IQ Ch");
+    iqLbl->setStyleSheet(kLabelStyle);
+    iqRow->addWidget(iqLbl);
+    m_daxIqCmb = new QComboBox;
+    m_daxIqCmb->addItems({"None", "1", "2", "3", "4"});
+    AetherSDR::applyComboStyle(m_daxIqCmb);
+    iqRow->addWidget(m_daxIqCmb, 1);
+    vb->addLayout(iqRow);
+
+    connect(m_daxIqCmb, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int idx) {
+        if (!m_updatingFromModel)
+            emit daxIqChannelChanged(idx);
     });
 
     m_daxPanel->setFixedWidth(140);
@@ -1087,6 +1131,11 @@ QPushButton* SpectrumOverlayMenu::dspNr2Button() const
 QPushButton* SpectrumOverlayMenu::dspRn2Button() const
 {
     return m_dspRows.size() > 7 ? m_dspRows[7].btn : nullptr;
+}
+
+QPushButton* SpectrumOverlayMenu::dspBnrButton() const
+{
+    return m_dspRows.size() > 11 ? m_dspRows[11].btn : nullptr;
 }
 
 bool SpectrumOverlayMenu::eventFilter(QObject* obj, QEvent* event)

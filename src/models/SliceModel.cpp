@@ -18,9 +18,22 @@ void SliceModel::sendCommand(const QString& cmd)
 
 void SliceModel::setFrequency(double mhz)
 {
-    if (m_locked) return;           // software lock — block tune while locked
+    if (m_locked) return;
     if (qFuzzyCompare(m_frequency, mhz)) return;
     m_frequency = mhz;
+    // autopan=0 prevents the radio from recentering the pan (#292).
+    // SmartSDR pcap confirms: scroll-wheel uses "slice tune <id> <freq> autopan=0".
+    sendCommand(QString("slice tune %1 %2 autopan=0").arg(m_id).arg(mhz, 0, 'f', 6));
+    emit frequencyChanged(mhz);
+}
+
+void SliceModel::tuneAndRecenter(double mhz)
+{
+    if (m_locked) return;
+    if (qFuzzyCompare(m_frequency, mhz)) return;
+    m_frequency = mhz;
+    // Without autopan=0, the radio recenters the pan on the new frequency.
+    // Used for band changes where recentering is desired.
     sendCommand(QString("slice tune %1 %2").arg(m_id).arg(mhz, 0, 'f', 6));
     emit frequencyChanged(mhz);
 }
@@ -315,6 +328,18 @@ void SliceModel::setActive(bool on)
         sendCommand(QString("slice set %1 active=1").arg(m_id));
 }
 
+// ─── Record/playback ────────────────────────────────────────────────────────
+
+void SliceModel::setRecordOn(bool on)
+{
+    sendCommand(QString("slice set %1 record=%2").arg(m_id).arg(on ? 1 : 0));
+}
+
+void SliceModel::setPlayOn(bool on)
+{
+    sendCommand(QString("slice set %1 play=%2").arg(m_id).arg(on ? 1 : 0));
+}
+
 // ─── FM duplex/repeater setters ──────────────────────────────────────────────
 
 void SliceModel::setFmToneMode(const QString& mode)
@@ -399,6 +424,36 @@ void SliceModel::setDiversity(bool on)
     emit diversityChanged(on);
 }
 
+void SliceModel::setEscEnabled(bool on)
+{
+    if (m_escEnabled == on) return;
+    m_escEnabled = on;
+    // FlexLib: only diversity parent sends ESC commands (Slice.cs:3367)
+    // SmartSDR pcap: uses "on"/"off" not "1"/"0"
+    if (!m_diversityChild)
+        sendCommand(QString("slice set %1 esc=%2").arg(m_id).arg(on ? "on" : "off"));
+    emit escEnabledChanged(on);
+}
+
+void SliceModel::setEscGain(float gain)
+{
+    gain = std::clamp(gain, 0.0f, 2.0f);
+    if (qFuzzyCompare(m_escGain, gain)) return;
+    m_escGain = gain;
+    if (!m_diversityChild)
+        sendCommand(QString("slice set %1 esc_gain=%2").arg(m_id).arg(gain, 0, 'f', 6));
+    emit escGainChanged(gain);
+}
+
+void SliceModel::setEscPhaseShift(float deg)
+{
+    if (qFuzzyCompare(m_escPhaseShift, deg)) return;
+    m_escPhaseShift = deg;
+    if (!m_diversityChild)
+        sendCommand(QString("slice set %1 esc_phase_shift=%2").arg(m_id).arg(deg, 0, 'f', 6));
+    emit escPhaseShiftChanged(deg);
+}
+
 void SliceModel::setAudioPan(int pan)
 {
     pan = qBound(0, pan, 100);
@@ -444,6 +499,22 @@ void SliceModel::applyStatus(const QMap<QString, QString>& kvs)
     if (kvs.contains("filter_lo") || kvs.contains("filter_hi")) {
         m_filterLow  = kvs.value("filter_lo",  QString::number(m_filterLow)).toInt();
         m_filterHigh = kvs.value("filter_hi", QString::number(m_filterHigh)).toInt();
+
+        // Radio sometimes sends wrong-polarity filter offsets after session
+        // restore (e.g. negative offsets for USB/DIGU). Normalize based on mode.
+        const bool isUsbFamily = (m_mode == "USB" || m_mode == "DIGU" || m_mode == "FDV");
+        const bool isLsbFamily = (m_mode == "LSB" || m_mode == "DIGL");
+        if (isUsbFamily && m_filterLow < 0 && m_filterHigh <= 0) {
+            // Flip: -2700,0 → 0,2700
+            int w = std::abs(m_filterLow);
+            m_filterLow = 0;
+            m_filterHigh = w;
+        } else if (isLsbFamily && m_filterLow >= 0 && m_filterHigh > 0) {
+            // Flip: 0,2700 → -2700,0
+            int w = m_filterHigh;
+            m_filterLow = -w;
+            m_filterHigh = 0;
+        }
         filterChanged_ = true;
     }
     if (kvs.contains("mode_list")) {
@@ -486,6 +557,12 @@ void SliceModel::applyStatus(const QMap<QString, QString>& kvs)
             emit audioMuteChanged(mute);
         }
     }
+    // Parse child/parent flags before emitting diversityChanged so handlers
+    // can check isDiversityChild() to gate ESC panel visibility.
+    if (kvs.contains("diversity_child"))
+        m_diversityChild = kvs["diversity_child"] == "1";
+    if (kvs.contains("diversity_parent"))
+        m_diversityParent = kvs["diversity_parent"] == "1";
     if (kvs.contains("diversity")) {
         bool div = kvs["diversity"] == "1";
         if (div != m_diversity) {
@@ -493,12 +570,23 @@ void SliceModel::applyStatus(const QMap<QString, QString>& kvs)
             emit diversityChanged(div);
         }
     }
-    if (kvs.contains("diversity_child"))
-        m_diversityChild = kvs["diversity_child"] == "1";
-    if (kvs.contains("diversity_parent"))
-        m_diversityParent = kvs["diversity_parent"] == "1";
     if (kvs.contains("diversity_index"))
         m_diversityIndex = kvs["diversity_index"].toInt();
+
+    // ESC (Enhanced Signal Clarity) — diversity beamforming
+    if (kvs.contains("esc")) {
+        const QString& v = kvs["esc"];
+        bool on = (v == "1" || v == "on");
+        if (on != m_escEnabled) { m_escEnabled = on; emit escEnabledChanged(on); }
+    }
+    if (kvs.contains("esc_gain")) {
+        float g = kvs["esc_gain"].toFloat();
+        if (!qFuzzyCompare(m_escGain, g)) { m_escGain = g; emit escGainChanged(g); }
+    }
+    if (kvs.contains("esc_phase_shift")) {
+        float p = kvs["esc_phase_shift"].toFloat();
+        if (!qFuzzyCompare(m_escPhaseShift, p)) { m_escPhaseShift = p; emit escPhaseShiftChanged(p); }
+    }
 
     // Slice control state
     if (kvs.contains("rxant")) {
@@ -635,6 +723,23 @@ void SliceModel::applyStatus(const QMap<QString, QString>& kvs)
         if (m_diguOffset != v) { m_diguOffset = v; emit diguOffsetChanged(v); }
     }
 
+    // Record/playback status
+    if (kvs.contains("record")) {
+        bool on = kvs["record"] == "1";
+        if (m_recordOn != on) { m_recordOn = on; emit recordOnChanged(on); }
+    }
+    if (kvs.contains("play")) {
+        const QString& v = kvs["play"];
+        if (v == "disabled") {
+            if (m_playEnabled) { m_playEnabled = false; emit playEnabledChanged(false); }
+            if (m_playOn) { m_playOn = false; emit playOnChanged(false); }
+        } else {
+            if (!m_playEnabled) { m_playEnabled = true; emit playEnabledChanged(true); }
+            bool on = (v == "1");
+            if (m_playOn != on) { m_playOn = on; emit playOnChanged(on); }
+        }
+    }
+
     // FM duplex/repeater status
     if (kvs.contains("fm_tone_mode")) {
         m_fmToneMode = kvs["fm_tone_mode"];
@@ -659,6 +764,21 @@ void SliceModel::applyStatus(const QMap<QString, QString>& kvs)
     if (kvs.contains("fm_deviation")) {
         m_fmDeviation = kvs["fm_deviation"].toInt();
         emit fmDeviationChanged(m_fmDeviation);
+    }
+
+    if (kvs.contains("step") || kvs.contains("step_list")) {
+        bool changed = false;
+        if (kvs.contains("step")) {
+            int s = kvs["step"].toInt();
+            if (s != m_stepHz) { m_stepHz = s; changed = true; }
+        }
+        if (kvs.contains("step_list")) {
+            QVector<int> list;
+            for (const auto& v : kvs["step_list"].split(','))
+                if (!v.isEmpty()) list.append(v.toInt());
+            if (list != m_stepList) { m_stepList = list; changed = true; }
+        }
+        if (changed) emit stepChanged(m_stepHz, m_stepList);
     }
 
     if (freqChanged)

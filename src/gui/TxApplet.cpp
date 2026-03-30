@@ -2,6 +2,7 @@
 #include "ComboStyle.h"
 #include "HGauge.h"
 #include "models/TransmitModel.h"
+#include "models/TunerModel.h"
 
 #include <QPushButton>
 #include <QLabel>
@@ -13,23 +14,7 @@
 
 namespace AetherSDR {
 
-// ── Shared gradient title bar (matches AppletPanel / TunerApplet style) ─────
 
-static QWidget* appletTitleBar(const QString& text)
-{
-    auto* bar = new QWidget;
-    bar->setFixedHeight(16);
-    bar->setStyleSheet(
-        "QWidget { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-        "stop:0 #3a4a5a, stop:0.5 #2a3a4a, stop:1 #1a2a38); "
-        "border-bottom: 1px solid #0a1a28; }");
-
-    auto* lbl = new QLabel(text, bar);
-    lbl->setStyleSheet("QLabel { background: transparent; color: #8aa8c0; "
-                       "font-size: 10px; font-weight: bold; }");
-    lbl->setGeometry(6, 1, 240, 14);
-    return bar;
-}
 
 // ── Styled indicator label (small coloured-dot + text) ──────────────────────
 
@@ -73,9 +58,6 @@ void TxApplet::buildUI()
     auto* outer = new QVBoxLayout(this);
     outer->setContentsMargins(0, 0, 0, 0);
     outer->setSpacing(0);
-
-    // Title bar
-    outer->addWidget(appletTitleBar("TX"));
 
     // Body with margins
     auto* body = new QWidget;
@@ -168,7 +150,9 @@ void TxApplet::buildUI()
             "QPushButton { background: #1a3a5a; border: 1px solid #205070; "
             "border-radius: 3px; color: #c8d8e8; font-size: 10px; font-weight: bold; "
             "padding: 2px; }"
-            "QPushButton:hover { background: #204060; }";
+            "QPushButton:hover { background: #204060; }"
+            "QPushButton:disabled { background-color: #1a1a2a; color: #556070; "
+            "border: 1px solid #2a3040; }";
 
         m_tuneBtn = new QPushButton("TUNE");
         m_tuneBtn->setStyleSheet(btnStyle);
@@ -374,6 +358,26 @@ void TxApplet::setTransmitModel(TransmitModel* model)
     syncAtuIndicators();
 }
 
+void TxApplet::setTunerModel(TunerModel* tuner)
+{
+    if (!tuner) return;
+
+    auto updateButtons = [this, tuner]() {
+        bool tgxlOperate = tuner->isPresent() && tuner->isOperate() && !tuner->isBypass();
+        m_tuneBtn->setEnabled(!tgxlOperate);
+        m_atuBtn->setEnabled(!tgxlOperate);
+        m_memBtn->setEnabled(!tgxlOperate);
+        QString tip = tgxlOperate ? "Disabled — TGXL is in OPERATE mode" : "";
+        m_tuneBtn->setToolTip(tip);
+        m_atuBtn->setToolTip(tip);
+        m_memBtn->setToolTip(tip);
+    };
+
+    connect(tuner, &TunerModel::stateChanged, this, updateButtons);
+    connect(tuner, &TunerModel::presenceChanged, this, updateButtons);
+    updateButtons();
+}
+
 void TxApplet::syncFromModel()
 {
     if (!m_model) return;
@@ -444,12 +448,11 @@ void TxApplet::updateMeters(float fwdPower, float swr)
 
 void TxApplet::setPowerScale(int maxWatts, bool hasAmplifier)
 {
+    Q_UNUSED(hasAmplifier);
+    // TX applet always shows exciter (barefoot) power.
+    // Amplified output power is shown in the AMP applet.
     auto* gauge = static_cast<HGauge*>(m_fwdGauge);
-    if (hasAmplifier) {
-        // PGXL: 0–2000 W, red > 1500 W
-        gauge->setRange(0.0f, 2000.0f, 1500.0f,
-            {{0, "0"}, {500, "500"}, {1500, "1.5k"}, {2000, "2k"}});
-    } else if (maxWatts > 100) {
+    if (maxWatts > 100) {
         // Aurora (500 W): 0–600 W, red > 500 W
         gauge->setRange(0.0f, 600.0f, 500.0f,
             {{0, "0"}, {100, "100"}, {200, "200"}, {300, "300"},

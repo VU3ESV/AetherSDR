@@ -11,6 +11,7 @@
 #include <atomic>
 #include <QBuffer>
 #include <QByteArray>
+#include <QElapsedTimer>
 
 #include <functional>
 #include <memory>
@@ -21,6 +22,7 @@ namespace AetherSDR {
 
 class SpectralNR;
 class RNNoiseFilter;
+class NvidiaBnrFilter;
 class Resampler;
 
 // AudioEngine handles audio playback (RX) and capture (TX).
@@ -54,9 +56,11 @@ public:
     bool startTxStream(const QHostAddress& radioAddress, quint16 radioPort);
     void stopTxStream();
 
-    // Set the TX stream ID (from radio's response to "stream create type=remote_audio_tx")
+    // Set the DAX TX stream ID (from radio's response to "stream create type=dax_tx")
     void setTxStreamId(quint32 id) { m_txStreamId = id; }
     quint32 txStreamId() const { return m_txStreamId; }
+    // Set the remote audio TX stream ID (for voice TX and VOX monitoring)
+    void setRemoteTxStreamId(quint32 id) { m_remoteTxStreamId = id; }
 
     float rxVolume() const  { return m_rxVolume; }
     void  setRxVolume(float v);
@@ -64,6 +68,9 @@ public:
     bool isMuted() const       { return m_muted; }
     void setMuted(bool m);
     bool isTxStreaming() const { return m_audioSource != nullptr; }
+
+    // Client-side PC mic gain (0-100 → 0.0-1.0, applied before Opus encoding)
+    void setPcMicGain(int level) { m_pcMicGain = qBound(0, level, 100) / 100.0f; }
 
     // Opus TX encoding for SmartLink compressed audio
     void setOpusTxEnabled(bool on) { m_opusTxEnabled = on; }
@@ -77,10 +84,14 @@ public:
     void sendModemTxAudio(const QByteArray& float32pcm);
 
     // DAX TX: VirtualAudioBridge feeds float32 PCM for VITA-49 TX
-    void setDaxTxMode(bool on) { m_daxTxMode = on; }
+    void setDaxTxMode(bool on);
     bool isDaxTxMode() const { return m_daxTxMode; }
-    void setTransmitting(bool tx) { m_transmitting = tx; }
-    void clearTxAccumulators() { m_txAccumulator.clear(); m_txFloatAccumulator.clear(); }
+    // true: radio DAX TX route (transmit dax=1, PCC 0x0123 int16 mono)
+    // false: low-latency PC mic route (transmit dax=0, PCC 0x03E3 float32 stereo)
+    void setDaxTxUseRadioRoute(bool on);
+    bool daxTxUseRadioRoute() const { return m_daxTxUseRadioRoute; }
+    void setTransmitting(bool tx);
+    void clearTxAccumulators() { m_txAccumulator.clear(); m_txFloatAccumulator.clear(); m_daxPreTxBuffer.clear(); }
     void feedDaxTxAudio(const QByteArray& float32pcm);
 
     // Plays RADE decoded speech (int16 stereo 24kHz) bypassing m_radeMode block
@@ -93,6 +104,15 @@ public:
     // Client-side RN2 (RNNoise neural noise suppression)
     void setRn2Enabled(bool on);
     bool rn2Enabled() const { return m_rn2Enabled; }
+
+    // Client-side BNR (NVIDIA NIM GPU noise removal)
+    void setBnrEnabled(bool on);
+    bool bnrEnabled() const { return m_bnrEnabled; }
+    void setBnrAddress(const QString& addr);
+    QString bnrAddress() const { return m_bnrAddress; }
+    void setBnrIntensity(float ratio);
+    float bnrIntensity() const;
+    bool bnrConnected() const;
 
     // Ensure FFTW wisdom is loaded/generated. Returns true if wisdom
     // needs to be generated (slow). Call generateWisdom() in that case.
@@ -116,8 +136,11 @@ signals:
     void levelChanged(float rms);  // audio level for VU meter, 0.0–1.0
     void nr2EnabledChanged(bool on);
     void rn2EnabledChanged(bool on);
+    void bnrEnabledChanged(bool on);
+    void bnrConnectionChanged(bool connected);
     void txRawPcmReady(const QByteArray& pcm);  // raw 24kHz stereo int16 PCM for RADEEngine
     void txPacketReady(const QByteArray& vitaPacket);  // VITA-49 TX packet for PanadapterStream
+    void pcMicLevelChanged(float peakDbfs, float avgDbfs);  // client-side PC mic metering
 
 private slots:
     void onTxAudioReady();
@@ -127,6 +150,7 @@ private:
     float computeRMS(const QByteArray& pcm) const;
     QByteArray applyBoost(const QByteArray& pcm, float gain) const;
     QByteArray buildVitaTxPacket(const float* samples, int numStereoSamples);
+    void sendVoiceTxPacket(const QByteArray& pcmData, quint32 streamId);
     QByteArray resampleStereo(const QByteArray& pcm);
     void processNr2(const QByteArray& stereoPcm);
 
@@ -144,16 +168,29 @@ private:
 #endif
     QHostAddress  m_txAddress;
     quint16       m_txPort{0};
-    quint32       m_txStreamId{0};
+    quint32       m_txStreamId{0};         // DAX TX stream
+    quint32       m_remoteTxStreamId{0};  // remote_audio_tx (voice/VOX)
     quint8        m_txPacketCount{0};    // 4-bit, mod 16
     QByteArray    m_txAccumulator;       // accumulate PCM until 128 stereo pairs
+    QByteArray    m_voxAccumulator;     // accumulate PCM for VOX/met_in_rx stream
     QByteArray    m_txFloatAccumulator;  // accumulate float32 PCM for RADE modem TX
+    QByteArray    m_daxPreTxBuffer;      // short rolling pre-TX buffer for low-latency DAX mode
     std::atomic<bool> m_radeMode{false}; // RADE digital voice mode active (atomic: cross-thread)
+    float         m_pcMicGain{1.0f};     // client-side PC mic gain (0.0-1.0)
     bool          m_daxTxMode{false};    // DAX TX mode: VirtualAudioBridge handles TX
+    bool          m_daxTxUseRadioRoute{false}; // false = low-latency route (dax=0)
     bool          m_transmitting{false}; // true when radio is in TX (MOX on)
     bool          m_opusTxEnabled{false}; // Opus TX encoding for SmartLink
     std::unique_ptr<class OpusCodec> m_opusTxCodec; // lazy-init on first TX with Opus
-    QByteArray    m_opusTxAccumulator;  // accumulate 480 stereo samples for Opus frame
+    QByteArray    m_opusTxAccumulator;  // accumulate stereo samples for Opus frame
+    QVector<QByteArray> m_opusTxQueue;  // pacing queue for even 10ms packet delivery
+    QTimer*       m_opusTxPaceTimer{nullptr};
+
+    // Client-side PC mic metering (accumulated over ~50ms window)
+    float         m_pcMicPeak{0.0f};
+    double        m_pcMicSumSq{0.0};
+    int           m_pcMicSampleCount{0};
+    static constexpr int kMicMeterWindowSamples = 24000 / 20;  // ~50ms at 24kHz
 
     QAudioDevice m_outputDevice;
     QAudioDevice m_inputDevice;
@@ -171,19 +208,30 @@ private:
     std::unique_ptr<RNNoiseFilter> m_rn2;
     bool m_rn2Enabled{false};
 
+    // Client-side BNR (NVIDIA NIM)
+    std::unique_ptr<NvidiaBnrFilter> m_bnr;
+    std::unique_ptr<Resampler> m_bnrUp;    // 24k→48k mono
+    std::unique_ptr<Resampler> m_bnrDown;  // 48k→24k mono
+    bool m_bnrEnabled{false};
+    QString m_bnrAddress{"localhost:8001"};
+    QByteArray m_bnrOutBuf;  // jitter buffer: denoised 24kHz stereo int16
+    bool m_bnrPrimed{false}; // true after enough denoised data accumulated
+    void processBnr(const QByteArray& stereoPcm);
+
     // Pre-allocated NR2 work buffers (avoid per-call heap allocation)
     std::vector<int16_t> m_nr2Mono;
     std::vector<int16_t> m_nr2Processed;
     QByteArray m_nr2Output;
 
     // VITA-49 TX constants
-    static constexpr int    TX_SAMPLES_PER_PACKET = 128;  // stereo pairs
-    static constexpr int    TX_PCM_BYTES_PER_PACKET = TX_SAMPLES_PER_PACKET * 2 * 2; // 128 pairs × 2ch × 2bytes
+    static constexpr int    TX_SAMPLES_PER_PACKET = 128;  // audio frames per packet
+    static constexpr int    TX_PCM_BYTES_PER_PACKET = TX_SAMPLES_PER_PACKET * 2 * 2; // 128 frames × 2ch × int16
     static constexpr int    VITA_HEADER_WORDS = 7;
     static constexpr int    VITA_HEADER_BYTES = VITA_HEADER_WORDS * 4;  // 28 bytes
     static constexpr quint32 FLEX_OUI = 0x001C2D;
     static constexpr quint16 FLEX_INFO_CLASS = 0x534C;
     static constexpr quint16 PCC_IF_NARROW = 0x03E3;
+    static constexpr quint16 PCC_DAX_REDUCED = 0x0123;  // reduced BW DAX (24kHz int16 mono)
 };
 
 } // namespace AetherSDR

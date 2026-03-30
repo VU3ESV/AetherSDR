@@ -10,6 +10,11 @@
 #include "TransmitModel.h"
 #include "EqualizerModel.h"
 #include "TnfModel.h"
+#include "SpotModel.h"
+#include "CwxModel.h"
+#include "DvkModel.h"
+#include "UsbCableModel.h"
+#include "DaxIqModel.h"
 
 #include <QObject>
 #include <QString>
@@ -62,6 +67,7 @@ class RadioModel : public QObject {
 
 public:
     explicit RadioModel(QObject* parent = nullptr);
+    ~RadioModel() override;
 
     // Access the underlying connection and panadapter stream
     RadioConnection*  connection()  { return &m_connection; }
@@ -71,6 +77,11 @@ public:
     TransmitModel*    transmitModel() { return &m_transmitModel; }
     EqualizerModel*   equalizerModel() { return &m_equalizerModel; }
     TnfModel*         tnfModel()       { return &m_tnfModel; }
+    SpotModel*        spotModel()      { return &m_spotModel; }
+    CwxModel*         cwxModel()       { return &m_cwxModel; }
+    DvkModel*         dvkModel()       { return &m_dvkModel; }
+    UsbCableModel*    usbCableModel()  { return &m_usbCableModel; }
+    DaxIqModel*       daxIqModel()     { return &m_daxIqModel; }
     bool              hasAmplifier() const { return m_hasAmplifier; }
 
     // Getters
@@ -121,6 +132,7 @@ public:
     bool    binauralRx()   const { return m_binauralRx; }
     bool    muteLocalWhenRemote() const { return m_muteLocalWhenRemote; }
     int     freqErrorPpb() const { return m_freqErrorPpb; }
+    double  calFreqMhz() const { return m_calFreqMhz; }
 
     // Audio output
     int     lineoutGain()    const { return m_lineoutGain; }
@@ -165,6 +177,7 @@ public:
     double panCenterMhz() const;
     double panBandwidthMhz() const;
     QString panId() const { return m_activePanId; }
+    void setActivePanId(const QString& id) { m_activePanId = id; }
     PanadapterModel* activePanadapter() const;
     PanadapterModel* panadapter(const QString& panId) const;
     QList<PanadapterModel*> panadapters() const { return m_panadapters.values(); }
@@ -176,13 +189,15 @@ public:
     void connectToRadio(const RadioInfo& info);
     void connectViaWan(WanConnection* wan, const QString& publicIp, quint16 udpPort);
     void disconnectFromRadio();
+    void forceDisconnect();  // Close TCP but allow auto-reconnect
     bool isWan() const { return m_wanConn != nullptr; }
     void setTransmit(bool tx);
     QString audioCompressionParam() const;        // "none" or "opus" based on settings
-    void sendCwKey(bool down);                    // straight key: cw key 0|1
-    void sendCwPaddle(bool dit, bool dah);        // iambic paddle: cw key <dit> <dah>
+    void sendCwKey(bool down);                    // straight key via netcw stream
+    void sendCwPaddle(bool dit, bool dah);        // iambic paddle via netcw stream
     void cwAutoTune(int sliceId, bool intermittent); // slice auto_tune
-    void addSlice();           // Create a new slice on the current panadapter
+    void addSlice();           // Create a new slice on the active panadapter
+    void addSliceOnPan(const QString& panId); // Create a new slice on a specific pan
     void createPanadapter();   // Create a new independent panadapter
     void removePanadapter(const QString& panId);
     void setPanBandwidth(double bandwidthMhz);
@@ -220,6 +235,8 @@ signals:
     void panadapterLevelChanged(float minDbm, float maxDbm);
     void panadapterAdded(PanadapterModel* pan);
     void panadapterRemoved(const QString& panId);
+    // Emitted when a pan needs xpixels/ypixels pushed (after profile change, reconnect, etc.)
+    void panDimensionsNeeded(const QString& panId);
     // Emitted when the radio reports its antenna list (e.g. "ANT1,ANT2,RX_A,RX_B").
     void antListChanged(QStringList ants);
     // Emitted when a power amplifier (e.g. PGXL) is detected or lost.
@@ -239,10 +256,16 @@ signals:
     // quality: "Excellent", "Very Good", "Good", "Fair", "Poor"
     // pingMs: round-trip time in milliseconds
     void networkQualityChanged(const QString& quality, int pingMs);
-    // Emitted when the radio assigns a TX audio stream ID.
+    // Emitted when the radio assigns a TX audio stream ID (DAX TX).
     void txAudioStreamReady(quint32 streamId);
+    // Emitted when the radio assigns a remote audio TX stream ID (voice/VOX).
+    void remoteTxStreamReady(quint32 streamId);
+    // Audio TX gate for sample pipeline (separate from optimistic MOX UI state).
+    void txAudioGateChanged(bool transmitting);
     // Emitted when global profile list or active profile changes.
     void globalProfilesChanged();
+    // Emitted on each successful ping response from the radio.
+    void pingReceived();
     // Generic status relay — for dialogs that need to listen for specific objects.
     void statusReceived(const QString& object, const QMap<QString, QString>& kvs);
 
@@ -272,7 +295,7 @@ private:
     void handleRadioStatus(const QMap<QString, QString>& kvs);
     void handleSliceStatus(int id, const QMap<QString, QString>& kvs, bool removed);
     void handleMeterStatus(const QString& rawBody);
-    void handlePanadapterStatus(const QMap<QString, QString>& kvs);
+    void handlePanadapterStatus(const QString& panId, const QMap<QString, QString>& kvs);
     void handleProfileStatus(const QString& object, const QMap<QString, QString>& kvs);
     void handleProfileStatusRaw(const QString& profileType, const QString& rawBody);
 
@@ -300,6 +323,17 @@ private:
     TransmitModel    m_transmitModel;
     EqualizerModel   m_equalizerModel;
     TnfModel         m_tnfModel;
+    SpotModel        m_spotModel;
+    CwxModel         m_cwxModel;
+    DvkModel         m_dvkModel;
+    UsbCableModel    m_usbCableModel;
+    DaxIqModel       m_daxIqModel;
+
+    // NetCW stream — VITA-49 UDP delivery for low-latency CW keying
+    quint32  m_netCwStreamId{0};
+    int      m_netCwIndex{1};           // sequential dedup index
+    void sendNetCwCommand(const QString& cmd);
+    QByteArray buildNetCwPacket(const QByteArray& payload);
 
     QString     m_name;
     QString     m_model;
@@ -336,6 +370,7 @@ private:
     bool        m_headphoneMute{false};
     bool        m_frontSpeakerMute{false};
     int         m_freqErrorPpb{0};
+    double      m_calFreqMhz{15.0};
     int         m_filterVoice{2};
     bool        m_filterVoiceAuto{false};
     int         m_filterCw{2};
@@ -346,6 +381,8 @@ private:
     bool        m_enforcePrivateIp{true};
     bool        m_remoteOnEnabled{false};
     bool        m_multiFlexEnabled{true};
+    bool        m_txRequested{false}; // local MOX command intent (for edge sync)
+    bool        m_txAudioGate{false}; // actual TX audio gate state
     QStringList m_antList;
 
     QMap<QString, PanadapterModel*> m_panadapters;  // panId → model
@@ -381,6 +418,10 @@ private:
         bool    tx3{false};
     };
     QMap<int, TxBandInfo> m_txBandSettings;
+    int  m_tuneInhibitBandId{-1};  // band ID whose acc_tx was inhibited during tune
+    bool m_tuneInhibitActive{false};
+
+    int bandIdForFrequency(double freqMhz) const;  // map TX freq → band ID
 
 public:
     const QMap<int, TxBandInfo>& txBandSettings() const { return m_txBandSettings; }
@@ -454,13 +495,15 @@ private:
     static constexpr int LAN_PING_POOR_MS = 100;
 
     QTimer        m_pingTimer;           // 1-second interval
-    QElapsedTimer m_pingStopwatch;       // measures RTT
+    // RTT now measured by RadioConnection::pingRttMeasured at socket-read time
     int           m_lastPingRtt{0};      // ms
     int           m_maxPingRtt{0};       // max RTT seen this session
     int           m_lastErrorCount{0};   // snapshot for delta
     NetState      m_netState{NetState::Off};
     NetState      m_nextState{NetState::Off};
     int           m_stateCountdown{0};
+    int           m_pingMissCount{0};          // consecutive unanswered pings
+    static constexpr int PING_MISS_DISCONNECT = 5; // force disconnect after 5 missed pings (~5s)
 
     // Network diagnostics — byte counters for rate calculation
     qint64        m_txBytes{0};          // total TCP bytes sent

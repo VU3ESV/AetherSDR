@@ -3,6 +3,7 @@
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QSlider>
 #include <QEvent>
 #include <QLabel>
 #include <QPushButton>
@@ -35,18 +36,18 @@ PanadapterApplet::PanadapterApplet(QWidget* parent)
     barLayout->addWidget(m_titleLabel);
     barLayout->addStretch();
 
-    // Placeholder window control buttons (non-functional for now)
     const QString btnStyle = QStringLiteral(
         "QPushButton { background: transparent; color: #6a8090; "
         "border: none; font-size: 9px; padding: 0; }"
         "QPushButton:hover { color: #c8d8e8; }");
 
-    for (const char* icon : {"_", "\u25A1", "\u00D7"}) {
-        auto* btn = new QPushButton(icon);
-        btn->setFixedSize(14, 14);
-        btn->setStyleSheet(btnStyle);
-        barLayout->addWidget(btn);
-    }
+    auto* closeBtn = new QPushButton("\u00D7");
+    closeBtn->setFixedSize(14, 14);
+    closeBtn->setStyleSheet(btnStyle + "QPushButton:hover { color: #ff4040; }");
+    connect(closeBtn, &QPushButton::clicked, this, [this]() {
+        emit closeRequested(m_panId);
+    });
+    barLayout->addWidget(closeBtn);
 
     layout->addWidget(titleBar);
 
@@ -75,6 +76,106 @@ PanadapterApplet::PanadapterApplet(QWidget* parent)
     m_cwStatsLabel = new QLabel;
     m_cwStatsLabel->setStyleSheet("QLabel { color: #6a8090; font-size: 10px; background: transparent; }");
     cwBar->addWidget(m_cwStatsLabel);
+
+    // Sensitivity slider — filters low-confidence decodes
+    auto* sensLabel = new QLabel("Sens:");
+    sensLabel->setStyleSheet("QLabel { color: #6a8090; font-size: 9px; background: transparent; }");
+    cwBar->addWidget(sensLabel);
+    m_cwSensSlider = new QSlider(Qt::Horizontal);
+    m_cwSensSlider->setRange(0, 100);  // 0=show everything, 100=only high confidence
+    m_cwSensSlider->setValue(30);      // default: moderate filtering
+    m_cwSensSlider->setFixedWidth(60);
+    m_cwSensSlider->setStyleSheet(
+        "QSlider::groove:horizontal { background: #1a2a3a; height: 4px; border-radius: 2px; }"
+        "QSlider::handle:horizontal { background: #00b4d8; width: 10px; margin: -3px 0; border-radius: 5px; }");
+    m_cwCostThreshold = 0.70f;  // default threshold
+    connect(m_cwSensSlider, &QSlider::valueChanged, this, [this](int v) {
+        // Map 0-100 slider to 1.0-0.1 cost threshold (inverted: higher sens = lower threshold)
+        m_cwCostThreshold = 1.0f - (v / 100.0f) * 0.9f;
+    });
+    cwBar->addWidget(m_cwSensSlider);
+
+    // Lock Pitch button
+    m_lockPitchBtn = new QPushButton("\xF0\x9F\x94\x92P");  // 🔒P
+    m_lockPitchBtn->setCheckable(true);
+    m_lockPitchBtn->setFixedSize(28, 16);
+    m_lockPitchBtn->setToolTip("Lock decoder pitch to current frequency");
+    m_lockPitchBtn->setStyleSheet(
+        "QPushButton { background: #1a2a3a; color: #6a8090; border: 1px solid #203040;"
+        " border-radius: 2px; font-size: 8px; padding: 0; }"
+        "QPushButton:checked { color: #00b4d8; border-color: #00b4d8; }"
+        "QPushButton:hover { color: #c8d8e8; }");
+    cwBar->addWidget(m_lockPitchBtn);
+
+    // Lock Speed button
+    m_lockSpeedBtn = new QPushButton("\xF0\x9F\x94\x92S");  // 🔒S
+    m_lockSpeedBtn->setCheckable(true);
+    m_lockSpeedBtn->setFixedSize(28, 16);
+    m_lockSpeedBtn->setToolTip("Lock decoder speed to current WPM");
+    m_lockSpeedBtn->setStyleSheet(m_lockPitchBtn->styleSheet());
+    cwBar->addWidget(m_lockSpeedBtn);
+
+    // Pitch range sliders — constrain decoder frequency search
+    const QString rangeSliderStyle =
+        "QSlider::groove:horizontal { background: #1a2a3a; height: 4px; border-radius: 2px; }"
+        "QSlider::handle:horizontal { background: #6a8090; width: 8px; margin: -3px 0; border-radius: 4px; }";
+
+    auto* minLabel = new QLabel("Lo:");
+    minLabel->setStyleSheet("QLabel { color: #6a8090; font-size: 8px; background: transparent; }");
+    cwBar->addWidget(minLabel);
+
+    m_pitchMinSlider = new QSlider(Qt::Horizontal);
+    m_pitchMinSlider->setRange(300, 1200);
+    m_pitchMinSlider->setValue(500);
+    m_pitchMinSlider->setFixedWidth(50);
+    m_pitchMinSlider->setStyleSheet(rangeSliderStyle);
+    m_pitchMinSlider->setToolTip("Decoder pitch search minimum (Hz)");
+    cwBar->addWidget(m_pitchMinSlider);
+    m_pitchMinValLabel = new QLabel(QString::number(m_pitchMinSlider->value()));
+    m_pitchMinValLabel->setStyleSheet("QLabel { color: #6a8090; font-size: 8px; background: transparent; }");
+    m_pitchMinValLabel->setFixedWidth(24);
+    cwBar->addWidget(m_pitchMinValLabel);
+
+    auto* maxLabel = new QLabel("Hi:");
+    maxLabel->setStyleSheet("QLabel { color: #6a8090; font-size: 8px; background: transparent; }");
+    cwBar->addWidget(maxLabel);
+
+    m_pitchMaxSlider = new QSlider(Qt::Horizontal);
+    m_pitchMaxSlider->setRange(300, 1200);
+    m_pitchMaxSlider->setValue(700);
+    m_pitchMaxSlider->setFixedWidth(50);
+    m_pitchMaxSlider->setStyleSheet(rangeSliderStyle);
+    m_pitchMaxSlider->setToolTip("Decoder pitch search maximum (Hz)");
+    cwBar->addWidget(m_pitchMaxSlider);
+    m_pitchMaxValLabel = new QLabel(QString::number(m_pitchMaxSlider->value()));
+    m_pitchMaxValLabel->setStyleSheet("QLabel { color: #6a8090; font-size: 8px; background: transparent; }");
+    m_pitchMaxValLabel->setFixedWidth(24);
+    cwBar->addWidget(m_pitchMaxValLabel);
+
+    // Update tooltips and emit range change — clamp so min ≤ max
+    connect(m_pitchMinSlider, &QSlider::valueChanged, this, [this](int v) {
+        if (v > m_pitchMaxSlider->value()) {
+            QSignalBlocker b(m_pitchMinSlider);
+            m_pitchMinSlider->setValue(m_pitchMaxSlider->value());
+            v = m_pitchMaxSlider->value();
+        }
+        m_pitchMinSlider->setToolTip(QString("%1 Hz").arg(v));
+        m_pitchMinValLabel->setText(QString::number(v));
+        emit pitchRangeChanged(v, m_pitchMaxSlider->value());
+    });
+    connect(m_pitchMaxSlider, &QSlider::valueChanged, this, [this](int v) {
+        if (v < m_pitchMinSlider->value()) {
+            QSignalBlocker b(m_pitchMaxSlider);
+            m_pitchMaxSlider->setValue(m_pitchMinSlider->value());
+            v = m_pitchMinSlider->value();
+        }
+        m_pitchMaxSlider->setToolTip(QString("%1 Hz").arg(v));
+        m_pitchMaxValLabel->setText(QString::number(v));
+        emit pitchRangeChanged(m_pitchMinSlider->value(), v);
+    });
+    m_pitchMinSlider->setToolTip(QString("%1 Hz").arg(m_pitchMinSlider->value()));
+    m_pitchMaxSlider->setToolTip(QString("%1 Hz").arg(m_pitchMaxSlider->value()));
+
     cwBar->addStretch();
 
     auto* clearBtn = new QPushButton("CLR");
@@ -114,6 +215,11 @@ void PanadapterApplet::setSliceId(int id)
     m_titleLabel->setText(QString("Slice %1").arg(letter));
 }
 
+void PanadapterApplet::clearSliceTitle()
+{
+    m_titleLabel->clear();
+}
+
 void PanadapterApplet::setCwPanelVisible(bool visible)
 {
     m_cwPanel->setVisible(visible);
@@ -121,6 +227,9 @@ void PanadapterApplet::setCwPanelVisible(bool visible)
 
 void PanadapterApplet::appendCwText(const QString& text, float cost)
 {
+    // Filter by sensitivity threshold — drop low-confidence decodes
+    if (cost >= m_cwCostThreshold) return;
+
     // Strip newlines — ggmorse inserts them on pitch changes, but we want
     // continuous flowing text. Replace with space to preserve word boundaries.
     QString clean = text;

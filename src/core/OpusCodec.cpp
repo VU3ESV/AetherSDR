@@ -1,7 +1,7 @@
 #include "OpusCodec.h"
 #include "LogManager.h"
 
-#ifdef HAVE_RADE
+#ifdef HAVE_OPUS
 #include <opus.h>
 #endif
 
@@ -11,7 +11,7 @@ namespace AetherSDR {
 
 OpusCodec::OpusCodec()
 {
-#ifdef HAVE_RADE
+#ifdef HAVE_OPUS
     int err;
     m_decoder = opus_decoder_create(SAMPLE_RATE, CHANNELS, &err);
     if (err != OPUS_OK || !m_decoder)
@@ -30,7 +30,7 @@ OpusCodec::OpusCodec()
 
 OpusCodec::~OpusCodec()
 {
-#ifdef HAVE_RADE
+#ifdef HAVE_OPUS
     if (m_decoder) opus_decoder_destroy(m_decoder);
     if (m_encoder) opus_encoder_destroy(m_encoder);
 #endif
@@ -38,7 +38,7 @@ OpusCodec::~OpusCodec()
 
 bool OpusCodec::isValid() const
 {
-#ifdef HAVE_RADE
+#ifdef HAVE_OPUS
     return m_decoder != nullptr && m_encoder != nullptr;
 #else
     return false;
@@ -47,28 +47,22 @@ bool OpusCodec::isValid() const
 
 QByteArray OpusCodec::decode(const QByteArray& opusFrame)
 {
-#ifdef HAVE_RADE
+#ifdef HAVE_OPUS
     if (!m_decoder || opusFrame.isEmpty()) return {};
 
-    // Decode Opus → mono int16 PCM
-    int16_t monoOut[FRAME_SIZE];
+    // Decode Opus → stereo int16 PCM (aligned for SSE)
+    alignas(16) int16_t stereoOut[FRAME_SIZE * CHANNELS];
     int samples = opus_decode(m_decoder,
         reinterpret_cast<const unsigned char*>(opusFrame.constData()),
-        opusFrame.size(), monoOut, FRAME_SIZE, 0);
+        opusFrame.size(), stereoOut, FRAME_SIZE, 0);
 
     if (samples <= 0) {
         qCWarning(lcAudio) << "OpusCodec: decode failed:" << opus_strerror(samples);
         return {};
     }
 
-    // Duplicate mono → stereo for AudioEngine
-    QByteArray stereo(samples * 2 * sizeof(int16_t), Qt::Uninitialized);
-    auto* dst = reinterpret_cast<int16_t*>(stereo.data());
-    for (int i = 0; i < samples; ++i) {
-        dst[i * 2]     = monoOut[i];
-        dst[i * 2 + 1] = monoOut[i];
-    }
-    return stereo;
+    return QByteArray(reinterpret_cast<const char*>(stereoOut),
+                      samples * CHANNELS * sizeof(int16_t));
 #else
     Q_UNUSED(opusFrame);
     return {};
@@ -77,24 +71,25 @@ QByteArray OpusCodec::decode(const QByteArray& opusFrame)
 
 QByteArray OpusCodec::encode(const QByteArray& pcmStereo)
 {
-#ifdef HAVE_RADE
+#ifdef HAVE_OPUS
     if (!m_encoder || pcmStereo.isEmpty()) return {};
 
-    // Convert stereo int16 → mono int16 (average L+R)
-    const auto* src = reinterpret_cast<const int16_t*>(pcmStereo.constData());
-    int stereoSamples = pcmStereo.size() / sizeof(int16_t);
-    int monoSamples = stereoSamples / 2;
+    // Input: stereo int16 interleaved, FRAME_SIZE sample frames (240 × 2 channels)
+    int totalSamples = pcmStereo.size() / sizeof(int16_t);
+    int frameSamples = totalSamples / CHANNELS;  // per-channel sample count
 
-    // Opus needs exactly FRAME_SIZE samples per encode call
-    if (monoSamples != FRAME_SIZE) return {};
+    // Opus needs exactly FRAME_SIZE samples per channel per encode call
+    if (frameSamples != FRAME_SIZE) return {};
 
-    int16_t monoIn[FRAME_SIZE];
-    for (int i = 0; i < FRAME_SIZE; ++i)
-        monoIn[i] = static_cast<int16_t>((src[i * 2] + src[i * 2 + 1]) / 2);
+    // Copy to 16-byte aligned buffer — opus SSE intrinsics (stereo_merge,
+    // _mm_mul_ps) require aligned input. QByteArray::constData() is NOT
+    // guaranteed to be 16-byte aligned, causing SEGV on SSE paths.
+    alignas(16) int16_t aligned[FRAME_SIZE * CHANNELS];
+    std::memcpy(aligned, pcmStereo.constData(), FRAME_SIZE * CHANNELS * sizeof(int16_t));
 
-    // Encode mono → Opus
+    // Encode stereo → Opus
     unsigned char opusOut[MAX_OPUS_BYTES];
-    int bytes = opus_encode(m_encoder, monoIn, FRAME_SIZE,
+    int bytes = opus_encode(m_encoder, aligned, FRAME_SIZE,
                             opusOut, MAX_OPUS_BYTES);
 
     if (bytes <= 0) {
@@ -112,7 +107,7 @@ QByteArray OpusCodec::encode(const QByteArray& pcmStereo)
 void OpusCodec::setBitrate(int bps)
 {
     m_bitrate = bps;
-#ifdef HAVE_RADE
+#ifdef HAVE_OPUS
     if (m_encoder)
         opus_encoder_ctl(m_encoder, OPUS_SET_BITRATE(bps));
 #endif

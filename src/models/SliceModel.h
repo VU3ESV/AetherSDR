@@ -68,11 +68,18 @@ public:
     int     ritFreq()     const { return m_ritFreq; }
     bool    xitOn()       const { return m_xitOn; }
     int     xitFreq()     const { return m_xitFreq; }
+    int     stepHz()      const { return m_stepHz; }
+    QVector<int> stepList() const { return m_stepList; }
     int     daxChannel()  const { return m_daxChannel; }
     int     rttyMark()    const { return m_rttyMark; }
     int     rttyShift()   const { return m_rttyShift; }
     int     diglOffset()  const { return m_diglOffset; }
     int     diguOffset()  const { return m_diguOffset; }
+
+    // Record/playback state (radio-managed)
+    bool    recordOn()    const { return m_recordOn; }
+    bool    playOn()      const { return m_playOn; }
+    bool    playEnabled() const { return m_playEnabled; }
 
     // Getters — FM duplex/repeater
     QString fmToneMode()          const { return m_fmToneMode; }
@@ -83,7 +90,8 @@ public:
     int     fmDeviation()         const { return m_fmDeviation; }
 
     // Setters (emit signals AND send radio commands)
-    void setFrequency(double mhz);
+    void setFrequency(double mhz);           // slice tune autopan=0 — no recenter
+    void tuneAndRecenter(double mhz);      // slice tune — recenters pan (band changes)
     void setMode(const QString& mode);
     void setFilterWidth(int low, int high);
     void setAudioGain(float gain);
@@ -95,6 +103,12 @@ public:
     bool isDiversityChild() const { return m_diversityChild; }
     bool isDiversityParent() const { return m_diversityParent; }
     int  diversityIndex() const { return m_diversityIndex; }
+    bool escEnabled() const { return m_escEnabled; }
+    float escGain() const { return m_escGain; }
+    float escPhaseShift() const { return m_escPhaseShift; }
+    void setEscEnabled(bool on);
+    void setEscGain(float gain);
+    void setEscPhaseShift(float deg);
     void setRxAntenna(const QString& ant);
     void setTxAntenna(const QString& ant);
     void setLocked(bool locked);
@@ -129,6 +143,8 @@ public:
     void setDiguOffset(int hz);
     void setTxSlice(bool on);
     void setActive(bool on);
+    void setRecordOn(bool on);
+    void setPlayOn(bool on);
 
     // Setters — FM duplex/repeater
     void setFmToneMode(const QString& mode);
@@ -179,8 +195,12 @@ signals:
     void agcThresholdChanged(int value);
     void audioMuteChanged(bool mute);
     void diversityChanged(bool on);
+    void escEnabledChanged(bool on);
+    void escGainChanged(float gain);
+    void escPhaseShiftChanged(float deg);
     void rfGainChanged(float gain);
     void squelchChanged(bool on, int level);
+    void stepChanged(int hz, const QVector<int>& stepList);
     void ritChanged(bool on, int hz);
     void xitChanged(bool on, int hz);
     void daxChannelChanged(int ch);
@@ -198,6 +218,9 @@ signals:
     void fmDeviationChanged(int hz);
 
     void modeListChanged(const QStringList& modes);
+    void recordOnChanged(bool on);
+    void playOnChanged(bool on);
+    void playEnabledChanged(bool enabled);
     void commandReady(const QString& cmd);  // ready to send to radio
 
 private:
@@ -224,6 +247,9 @@ private:
     bool    m_diversityChild{false};
     bool    m_diversityParent{false};
     int     m_diversityIndex{-1};
+    bool    m_escEnabled{false};
+    float   m_escGain{1.0f};
+    float   m_escPhaseShift{0.0f};
     bool    m_nb{false};
     bool    m_nr{false};
     bool    m_anf{false};
@@ -246,6 +272,8 @@ private:
     int     m_agcThreshold{65};
     bool    m_squelchOn{false};
     int     m_squelchLevel{20};
+    int     m_stepHz{100};
+    QVector<int> m_stepList;
     bool    m_ritOn{false};
     int     m_ritFreq{0};
     bool    m_xitOn{false};
@@ -263,6 +291,11 @@ private:
     double  m_fmRepeaterOffsetFreq{0.0};
     double  m_txOffsetFreq{0.0};
     int     m_fmDeviation{5000};
+
+    // Record/playback
+    bool    m_recordOn{false};
+    bool    m_playOn{false};
+    bool    m_playEnabled{false};
 
     void sendCommand(const QString& cmd);
 

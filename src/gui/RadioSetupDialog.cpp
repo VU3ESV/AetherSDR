@@ -5,6 +5,7 @@
 #include "core/AudioEngine.h"
 #ifdef HAVE_SERIALPORT
 #include "core/SerialPortController.h"
+#include "core/FlexControlManager.h"
 #include <QSerialPortInfo>
 #endif
 #include "core/FirmwareUploader.h"
@@ -30,6 +31,11 @@
 #include <QFileInfo>
 #include <QMessageBox>
 #include <QProgressBar>
+#include <QProcess>
+#include <QListWidget>
+#include <QStackedWidget>
+#include <QPlainTextEdit>
+#include <QSplitter>
 
 namespace AetherSDR {
 
@@ -53,7 +59,7 @@ RadioSetupDialog::RadioSetupDialog(RadioModel* model, AudioEngine* audio, QWidge
     : QDialog(parent), m_model(model), m_audio(audio)
 {
     setWindowTitle("Radio Setup");
-    setMinimumSize(660, 520);
+    setMinimumSize(820, 520);
     setStyleSheet("QDialog { background: #0f0f1a; }");
 
     auto* layout = new QVBoxLayout(this);
@@ -75,6 +81,7 @@ RadioSetupDialog::RadioSetupDialog(RadioModel* model, AudioEngine* audio, QWidge
     tabs->addTab(buildRxTab(), "RX");
     tabs->addTab(buildFiltersTab(), "Filters");
     tabs->addTab(buildXvtrTab(), "XVTR");
+    tabs->addTab(buildUsbCablesTab(), "USB Cables");
 #ifdef HAVE_SERIALPORT
     tabs->addTab(buildSerialTab(), "Serial");
 #endif
@@ -516,116 +523,114 @@ QWidget* RadioSetupDialog::buildNetworkTab()
     }
 
     // DHCP / Static IP group
-    {
-        auto* group = new QGroupBox("IP Configuration");
-        group->setStyleSheet(kGroupStyle);
-        auto* gvbox = new QVBoxLayout(group);
-        gvbox->setSpacing(6);
-
-        // DHCP / Static buttons
-        auto* btnRow = new QHBoxLayout;
-        btnRow->setSpacing(4);
-
-        const bool isStatic = m_model->hasStaticIp();
-
-        auto* dhcpBtn = new QPushButton("DHCP");
-        dhcpBtn->setCheckable(true);
-        dhcpBtn->setChecked(!isStatic);
-        dhcpBtn->setStyleSheet(
-            "QPushButton { background: #1a2a3a; border: 1px solid #304050; "
-            "border-radius: 3px; color: #c8d8e8; font-size: 11px; font-weight: bold; "
-            "padding: 4px 16px; }"
-            "QPushButton:checked { background: #0070c0; color: #ffffff; "
-            "border: 1px solid #0090e0; }");
-        btnRow->addWidget(dhcpBtn);
-
-        auto* staticBtn = new QPushButton("Static");
-        staticBtn->setCheckable(true);
-        staticBtn->setChecked(isStatic);
-        staticBtn->setStyleSheet(dhcpBtn->styleSheet());
-        btnRow->addWidget(staticBtn);
-
-        btnRow->addStretch(1);
-        gvbox->addLayout(btnRow);
-
-        // Static IP fields
-        auto* fieldsGrid = new QGridLayout;
-        fieldsGrid->setSpacing(4);
-
-        fieldsGrid->addWidget(new QLabel("IP Address:"), 0, 0);
-        // If static is configured, show those values; otherwise show current DHCP values
-        auto* staticIp = new QLineEdit(isStatic ? m_model->staticIp() : m_model->ip());
-        staticIp->setStyleSheet(kEditStyle);
-        staticIp->setEnabled(isStatic);
-        fieldsGrid->addWidget(staticIp, 0, 1);
-
-        fieldsGrid->addWidget(new QLabel("Mask:"), 1, 0);
-        auto* staticMask = new QLineEdit(isStatic ? m_model->staticNetmask() : m_model->netmask());
-        staticMask->setStyleSheet(kEditStyle);
-        staticMask->setEnabled(isStatic);
-        fieldsGrid->addWidget(staticMask, 1, 1);
-
-        fieldsGrid->addWidget(new QLabel("Gateway:"), 2, 0);
-        auto* staticGw = new QLineEdit(isStatic ? m_model->staticGateway() : m_model->gateway());
-        staticGw->setStyleSheet(kEditStyle);
-        staticGw->setEnabled(isStatic);
-        fieldsGrid->addWidget(staticGw, 2, 1);
-
-        for (auto* lbl : group->findChildren<QLabel*>())
-            if (lbl->styleSheet().isEmpty()) lbl->setStyleSheet(kLabelStyle);
-
-        gvbox->addLayout(fieldsGrid);
-
-        // Apply button
-        auto* applyBtn = new QPushButton("Apply");
-        applyBtn->setEnabled(false);
-        applyBtn->setStyleSheet(
-            "QPushButton { background: #1a2a3a; border: 1px solid #304050; "
-            "border-radius: 3px; color: #c8d8e8; font-size: 11px; font-weight: bold; "
-            "padding: 4px 16px; }"
-            "QPushButton:hover { background: #203040; }");
-        gvbox->addWidget(applyBtn, 0, Qt::AlignLeft);
-
-        // DHCP/Static toggle logic
-        connect(dhcpBtn, &QPushButton::clicked, this,
-                [dhcpBtn, staticBtn, staticIp, staticMask, staticGw, applyBtn] {
-            dhcpBtn->setChecked(true);
-            staticBtn->setChecked(false);
-            staticIp->setEnabled(false);
-            staticMask->setEnabled(false);
-            staticGw->setEnabled(false);
-            applyBtn->setEnabled(true);
-        });
-        connect(staticBtn, &QPushButton::clicked, this,
-                [dhcpBtn, staticBtn, staticIp, staticMask, staticGw, applyBtn] {
-            dhcpBtn->setChecked(false);
-            staticBtn->setChecked(true);
-            staticIp->setEnabled(true);
-            staticMask->setEnabled(true);
-            staticGw->setEnabled(true);
-            applyBtn->setEnabled(true);
-        });
-
-        // Apply sends the command
-        connect(applyBtn, &QPushButton::clicked, this,
-                [this, dhcpBtn, staticIp, staticMask, staticGw, applyBtn] {
-            if (dhcpBtn->isChecked()) {
-                m_model->connection()->sendCommand("radio static_net_params reset");
-                qDebug() << "RadioSetupDialog: network set to DHCP";
-            } else {
-                const QString cmd = QString("radio static_net_params ip=%1 gateway=%2 netmask=%3")
-                    .arg(staticIp->text(), staticGw->text(), staticMask->text());
-                m_model->connection()->sendCommand(cmd);
-                qDebug() << "RadioSetupDialog: static IP applied" << cmd;
-            }
-            applyBtn->setEnabled(false);
-        });
-
-        vbox->addWidget(group);
-    }
+    vbox->addWidget(buildIpConfigGroup());
 
     vbox->addStretch(1);
     return page;
+}
+
+// Extracted to reduce lambda nesting depth in buildNetworkTab()
+// (avoids GCC 13 internal compiler error on Ubuntu 24.04)
+QGroupBox* RadioSetupDialog::buildIpConfigGroup()
+{
+    auto* group = new QGroupBox("IP Configuration");
+    group->setStyleSheet(kGroupStyle);
+    auto* gvbox = new QVBoxLayout(group);
+    gvbox->setSpacing(6);
+
+    auto* btnRow = new QHBoxLayout;
+    btnRow->setSpacing(4);
+
+    const bool isStatic = m_model->hasStaticIp();
+
+    auto* dhcpBtn = new QPushButton("DHCP");
+    dhcpBtn->setCheckable(true);
+    dhcpBtn->setChecked(!isStatic);
+    dhcpBtn->setStyleSheet(
+        "QPushButton { background: #1a2a3a; border: 1px solid #304050; "
+        "border-radius: 3px; color: #c8d8e8; font-size: 11px; font-weight: bold; "
+        "padding: 4px 16px; }"
+        "QPushButton:checked { background: #0070c0; color: #ffffff; "
+        "border: 1px solid #0090e0; }");
+    btnRow->addWidget(dhcpBtn);
+
+    auto* staticBtn = new QPushButton("Static");
+    staticBtn->setCheckable(true);
+    staticBtn->setChecked(isStatic);
+    staticBtn->setStyleSheet(dhcpBtn->styleSheet());
+    btnRow->addWidget(staticBtn);
+
+    btnRow->addStretch(1);
+    gvbox->addLayout(btnRow);
+
+    auto* fieldsGrid = new QGridLayout;
+    fieldsGrid->setSpacing(4);
+
+    fieldsGrid->addWidget(new QLabel("IP Address:"), 0, 0);
+    auto* staticIp = new QLineEdit(isStatic ? m_model->staticIp() : m_model->ip());
+    staticIp->setStyleSheet(kEditStyle);
+    staticIp->setEnabled(isStatic);
+    fieldsGrid->addWidget(staticIp, 0, 1);
+
+    fieldsGrid->addWidget(new QLabel("Mask:"), 1, 0);
+    auto* staticMask = new QLineEdit(isStatic ? m_model->staticNetmask() : m_model->netmask());
+    staticMask->setStyleSheet(kEditStyle);
+    staticMask->setEnabled(isStatic);
+    fieldsGrid->addWidget(staticMask, 1, 1);
+
+    fieldsGrid->addWidget(new QLabel("Gateway:"), 2, 0);
+    auto* staticGw = new QLineEdit(isStatic ? m_model->staticGateway() : m_model->gateway());
+    staticGw->setStyleSheet(kEditStyle);
+    staticGw->setEnabled(isStatic);
+    fieldsGrid->addWidget(staticGw, 2, 1);
+
+    for (auto* lbl : group->findChildren<QLabel*>())
+        if (lbl->styleSheet().isEmpty()) lbl->setStyleSheet(kLabelStyle);
+
+    gvbox->addLayout(fieldsGrid);
+
+    auto* applyBtn = new QPushButton("Apply");
+    applyBtn->setEnabled(false);
+    applyBtn->setStyleSheet(
+        "QPushButton { background: #1a2a3a; border: 1px solid #304050; "
+        "border-radius: 3px; color: #c8d8e8; font-size: 11px; font-weight: bold; "
+        "padding: 4px 16px; }"
+        "QPushButton:hover { background: #203040; }");
+    gvbox->addWidget(applyBtn, 0, Qt::AlignLeft);
+
+    connect(dhcpBtn, &QPushButton::clicked, this,
+            [dhcpBtn, staticBtn, staticIp, staticMask, staticGw, applyBtn] {
+        dhcpBtn->setChecked(true);
+        staticBtn->setChecked(false);
+        staticIp->setEnabled(false);
+        staticMask->setEnabled(false);
+        staticGw->setEnabled(false);
+        applyBtn->setEnabled(true);
+    });
+    connect(staticBtn, &QPushButton::clicked, this,
+            [dhcpBtn, staticBtn, staticIp, staticMask, staticGw, applyBtn] {
+        dhcpBtn->setChecked(false);
+        staticBtn->setChecked(true);
+        staticIp->setEnabled(true);
+        staticMask->setEnabled(true);
+        staticGw->setEnabled(true);
+        applyBtn->setEnabled(true);
+    });
+    connect(applyBtn, &QPushButton::clicked, this,
+            [this, dhcpBtn, staticIp, staticMask, staticGw, applyBtn] {
+        if (dhcpBtn->isChecked()) {
+            m_model->connection()->sendCommand("radio static_net_params reset");
+            qDebug() << "RadioSetupDialog: network set to DHCP";
+        } else {
+            const QString cmd = QString("radio static_net_params ip=%1 gateway=%2 netmask=%3")
+                .arg(staticIp->text(), staticGw->text(), staticMask->text());
+            m_model->connection()->sendCommand(cmd);
+            qDebug() << "RadioSetupDialog: static IP applied" << cmd;
+        }
+        applyBtn->setEnabled(false);
+    });
+
+    return group;
 }
 QWidget* RadioSetupDialog::buildGpsTab()
 {
@@ -1189,19 +1194,50 @@ QWidget* RadioSetupDialog::buildRxTab()
             lbl->setWordWrap(true);
             gvb->addWidget(lbl);
 
+            // Cal Frequency row
+            auto* calRow = new QHBoxLayout;
+            calRow->setSpacing(4);
+            auto* calLbl = new QLabel("Cal Frequency (MHz):");
+            calLbl->setStyleSheet(kLabelStyle);
+            calRow->addWidget(calLbl);
+            auto* calEdit = new QLineEdit(QString::number(m_model->calFreqMhz(), 'f', 6));
+            calEdit->setStyleSheet(kEditStyle);
+            calEdit->setFixedWidth(100);
+            connect(calEdit, &QLineEdit::editingFinished, this, [this, calEdit] {
+                m_model->sendCommand(
+                    "radio set cal_freq=" + calEdit->text());
+            });
+            calRow->addWidget(calEdit);
+
+            auto* startBtn = new QPushButton("Start");
+            startBtn->setStyleSheet(kTogStyle);
+            startBtn->setFixedWidth(60);
+            connect(startBtn, &QPushButton::clicked, this, [this, calEdit] {
+                // Set cal_freq and trigger calibration
+                m_model->sendCommand(
+                    "radio set cal_freq=" + calEdit->text());
+            });
+            calRow->addWidget(startBtn);
+            calRow->addStretch(1);
+            gvb->addLayout(calRow);
+
+            // Freq Error PPB row
             auto* row = new QHBoxLayout;
             row->setSpacing(4);
-            auto* ppbLbl = new QLabel("Freq Error (ppb):");
+            auto* ppbLbl = new QLabel("Freq Offset (ppb):");
             ppbLbl->setStyleSheet(kLabelStyle);
             row->addWidget(ppbLbl);
             auto* ppbEdit = new QLineEdit(QString::number(m_model->freqErrorPpb()));
             ppbEdit->setStyleSheet(kEditStyle);
             ppbEdit->setFixedWidth(80);
             connect(ppbEdit, &QLineEdit::editingFinished, this, [this, ppbEdit] {
-                m_model->connection()->sendCommand(
+                m_model->sendCommand(
                     "radio set freq_error_ppb=" + ppbEdit->text());
             });
             row->addWidget(ppbEdit);
+            auto* ppbUnitLbl = new QLabel("ppb");
+            ppbUnitLbl->setStyleSheet(kLabelStyle);
+            row->addWidget(ppbUnitLbl);
             row->addStretch(1);
             gvb->addLayout(row);
         }
@@ -1498,6 +1534,125 @@ QWidget* RadioSetupDialog::buildAudioTab()
     }
 
     vbox->addWidget(pcGroup);
+
+    // ── NVIDIA BNR (GPU Noise Removal) ──────────────────────────────────
+#ifdef HAVE_BNR
+    {
+        auto* bnrGroup = new QGroupBox("NVIDIA BNR (GPU Noise Removal)");
+        bnrGroup->setStyleSheet(kGroupStyle);
+        auto* bnrLayout = new QVBoxLayout(bnrGroup);
+
+        // Autostart checkbox
+        auto* autoRow = new QHBoxLayout;
+        auto* autoStart = new QPushButton("Autostart Container");
+        autoStart->setCheckable(true);
+        autoStart->setChecked(
+            AppSettings::instance().value("BnrAutostart", "False").toString() == "True");
+        autoStart->setStyleSheet(
+            "QPushButton { background: #1a2a3a; border: 1px solid #304050; "
+            "border-radius: 3px; color: #c8d8e8; font-size: 11px; padding: 2px 10px; }"
+            "QPushButton:checked { background: #00607a; color: #e0f0ff; border-color: #00b4d8; }");
+        autoRow->addWidget(autoStart);
+
+        // Container name
+        auto* nameLbl = new QLabel("Container:");
+        nameLbl->setStyleSheet(kLabelStyle);
+        auto* nameEdit = new QLineEdit(
+            AppSettings::instance().value("BnrContainerName", "maxine-bnr").toString());
+        nameEdit->setFixedWidth(120);
+        nameEdit->setStyleSheet(
+            "QLineEdit { background: #1a2a3a; border: 1px solid #304050; "
+            "border-radius: 3px; color: #c8d8e8; font-size: 11px; padding: 2px 4px; }");
+        autoRow->addWidget(nameLbl);
+        autoRow->addWidget(nameEdit);
+        autoRow->addStretch(1);
+        bnrLayout->addLayout(autoRow);
+
+        // Status row
+        auto* statusRow = new QHBoxLayout;
+        auto* statusDot = new QLabel("\u2B24");  // filled circle
+        statusDot->setStyleSheet("QLabel { color: #404040; font-size: 10px; }");
+        auto* statusLbl = new QLabel("Unknown");
+        statusLbl->setStyleSheet(kLabelStyle);
+        statusRow->addWidget(statusDot);
+        statusRow->addWidget(statusLbl);
+
+        auto* checkBtn = new QPushButton("Check Status");
+        checkBtn->setFixedWidth(90);
+        checkBtn->setStyleSheet(
+            "QPushButton { background: #1a2a3a; border: 1px solid #304050; "
+            "border-radius: 3px; color: #c8d8e8; font-size: 11px; padding: 2px; }"
+            "QPushButton:hover { background: #203040; }");
+        statusRow->addWidget(checkBtn);
+
+        auto* startBtn = new QPushButton("Start");
+        startBtn->setFixedWidth(50);
+        startBtn->setStyleSheet(checkBtn->styleSheet());
+        statusRow->addWidget(startBtn);
+
+        auto* stopBtn = new QPushButton("Stop");
+        stopBtn->setFixedWidth(50);
+        stopBtn->setStyleSheet(checkBtn->styleSheet());
+        statusRow->addWidget(stopBtn);
+        statusRow->addStretch(1);
+        bnrLayout->addLayout(statusRow);
+
+        // Check container status
+        auto checkStatus = [statusDot, statusLbl, nameEdit]() {
+            QProcess proc;
+            proc.start("docker", {"inspect", "-f", "{{.State.Status}}", nameEdit->text()});
+            proc.waitForFinished(3000);
+            QString out = proc.readAllStandardOutput().trimmed();
+            QString err = proc.readAllStandardError().trimmed();
+            qDebug() << "BNR checkStatus:" << out << err << "exit:" << proc.exitCode();
+            if (out == "running") {
+                statusDot->setStyleSheet("QLabel { color: #00d860; font-size: 10px; }");
+                statusLbl->setText("Running");
+            } else if (!out.isEmpty()) {
+                statusDot->setStyleSheet("QLabel { color: #d8a000; font-size: 10px; }");
+                statusLbl->setText("Stopped (" + out + ")");
+            } else {
+                statusDot->setStyleSheet("QLabel { color: #d83030; font-size: 10px; }");
+                statusLbl->setText("Not found");
+            }
+        };
+
+        connect(checkBtn, &QPushButton::clicked, this, checkStatus);
+
+        connect(startBtn, &QPushButton::clicked, this,
+                [nameEdit, statusLbl, checkStatus]() {
+            auto* proc = new QProcess;
+            connect(proc, &QProcess::finished, statusLbl, [proc, checkStatus]() {
+                proc->deleteLater();
+                checkStatus();
+            });
+            proc->start("docker", {"start", nameEdit->text()});
+        });
+
+        connect(stopBtn, &QPushButton::clicked, this,
+                [nameEdit, statusLbl, checkStatus]() {
+            auto* proc = new QProcess;
+            connect(proc, &QProcess::finished, statusLbl, [proc, checkStatus]() {
+                proc->deleteLater();
+                checkStatus();
+            });
+            proc->start("docker", {"stop", nameEdit->text()});
+        });
+
+        connect(autoStart, &QPushButton::toggled, this, [](bool on) {
+            AppSettings::instance().setValue("BnrAutostart", on ? "True" : "False");
+        });
+        connect(nameEdit, &QLineEdit::textChanged, this, [](const QString& name) {
+            AppSettings::instance().setValue("BnrContainerName", name);
+        });
+
+        vbox->addWidget(bnrGroup);
+
+        // Check on dialog open (context object ensures timer is cancelled if dialog closes)
+        QTimer::singleShot(0, statusLbl, checkStatus);
+    }
+#endif
+
     vbox->addStretch(1);
     return page;
 }
@@ -1802,6 +1957,577 @@ QWidget* RadioSetupDialog::buildXvtrTab()
     return page;
 }
 
+// ── USB Cables tab ───────────────────────────────────────────────────────────
+
+QWidget* RadioSetupDialog::buildUsbCablesTab()
+{
+    auto* page = new QWidget;
+    auto* hbox = new QHBoxLayout(page);
+    hbox->setSpacing(6);
+
+    auto* cableModel = m_model->usbCableModel();
+
+    // Style constants
+    static const QString kCombo =
+        "QComboBox { background: #1a2a3a; border: 1px solid #304050; "
+        "border-radius: 3px; color: #c8d8e8; font-size: 11px; padding: 2px 4px; }"
+        "QComboBox::drop-down { border: none; }"
+        "QComboBox QAbstractItemView { background: #1a2a3a; color: #c8d8e8; "
+        "selection-background-color: #00b4d8; }";
+    static const QString kEdit =
+        "QLineEdit { background: #1a2a3a; border: 1px solid #304050; "
+        "border-radius: 3px; color: #c8d8e8; font-size: 11px; padding: 2px 4px; }";
+    static const QString kSpin =
+        "QSpinBox { background: #1a2a3a; border: 1px solid #304050; "
+        "color: #c8d8e8; font-size: 11px; padding: 2px; }";
+    static const QString kCheck =
+        "QCheckBox { color: #c8d8e8; font-size: 11px; }";
+
+    // ── Left: cable list ────────────────────────────────────────────────
+    auto* listGroup = new QGroupBox("Cables");
+    listGroup->setStyleSheet(kGroupStyle);
+    listGroup->setFixedWidth(180);
+    auto* listLayout = new QVBoxLayout(listGroup);
+
+    auto* cableList = new QListWidget;
+    cableList->setStyleSheet(
+        "QListWidget { background: #0a0a14; color: #c8d8e8; border: 1px solid #203040; "
+        "font-size: 11px; }"
+        "QListWidget::item { padding: 4px; }"
+        "QListWidget::item:selected { background: #00b4d8; color: #0f0f1a; }");
+    listLayout->addWidget(cableList);
+    hbox->addWidget(listGroup);
+
+    // ── Right: stacked property panels ──────────────────────────────────
+    auto* stack = new QStackedWidget;
+
+    // Page 0: No cable selected
+    {
+        auto* empty = new QWidget;
+        auto* emptyLayout = new QVBoxLayout(empty);
+        auto* lbl = new QLabel("No USB cables detected.\n\nPlug a USB-serial adapter\n"
+                               "into the radio's rear USB port.");
+        lbl->setAlignment(Qt::AlignCenter);
+        lbl->setStyleSheet("QLabel { color: #606880; font-size: 12px; }");
+        emptyLayout->addWidget(lbl);
+        stack->addWidget(empty);  // index 0
+    }
+
+    // Helper: create source combo (shared across CAT, BCD, Bit)
+    auto makeSourceCombo = []() {
+        auto* combo = new QComboBox;
+        combo->addItems({"None", "TX Pan", "TX Slice", "Active Slice",
+                         "TX Ant", "RX Ant", "Ordinal Slice"});
+        combo->setStyleSheet(kCombo);
+        return combo;
+    };
+    // Map source display name → protocol value
+    auto sourceToProto = [](const QString& display) -> QString {
+        if (display == "TX Pan")        return "tx_pan";
+        if (display == "TX Slice")      return "tx_slice";
+        if (display == "Active Slice")  return "active_slice";
+        if (display == "TX Ant")        return "tx_ant";
+        if (display == "RX Ant")        return "rx_ant";
+        if (display == "Ordinal Slice") return "ordinal_slice";
+        return "None";
+    };
+    auto protoToSource = [](const QString& proto) -> int {
+        if (proto == "tx_pan")        return 1;
+        if (proto == "tx_slice")      return 2;
+        if (proto == "active_slice")  return 3;
+        if (proto == "tx_ant")        return 4;
+        if (proto == "rx_ant")        return 5;
+        if (proto == "ordinal_slice") return 6;
+        return 0;  // None
+    };
+
+    // Helper: serial parameter group (shared by CAT and Passthrough)
+    auto makeSerialGroup = [](const QString& title) {
+        auto* group = new QGroupBox(title);
+        group->setStyleSheet(kGroupStyle);
+        auto* grid = new QGridLayout(group);
+        grid->setSpacing(4);
+
+        auto* speedCombo = new QComboBox;
+        for (int s : {300,600,1200,2400,4800,9600,14400,19200,38400,57600,115200,230400,460800,921600})
+            speedCombo->addItem(QString::number(s));
+        speedCombo->setCurrentText("9600");
+        speedCombo->setStyleSheet(kCombo);
+        grid->addWidget(new QLabel("Speed:"), 0, 0);
+        grid->addWidget(speedCombo, 0, 1);
+
+        auto* dataCombo = new QComboBox;
+        dataCombo->addItems({"7", "8"});
+        dataCombo->setCurrentText("8");
+        dataCombo->setStyleSheet(kCombo);
+        grid->addWidget(new QLabel("Data Bits:"), 1, 0);
+        grid->addWidget(dataCombo, 1, 1);
+
+        auto* parityCombo = new QComboBox;
+        parityCombo->addItems({"none", "odd", "even", "mark", "space"});
+        parityCombo->setStyleSheet(kCombo);
+        grid->addWidget(new QLabel("Parity:"), 2, 0);
+        grid->addWidget(parityCombo, 2, 1);
+
+        auto* stopCombo = new QComboBox;
+        stopCombo->addItems({"1", "2"});
+        stopCombo->setStyleSheet(kCombo);
+        grid->addWidget(new QLabel("Stop Bits:"), 3, 0);
+        grid->addWidget(stopCombo, 3, 1);
+
+        auto* flowCombo = new QComboBox;
+        flowCombo->addItems({"none", "rts_cts", "dtr_dsr", "xon_xoff"});
+        flowCombo->setStyleSheet(kCombo);
+        grid->addWidget(new QLabel("Flow:"), 4, 0);
+        grid->addWidget(flowCombo, 4, 1);
+
+        struct SerialWidgets { QComboBox *speed, *data, *parity, *stop, *flow; QGroupBox* group; };
+        auto* w = new SerialWidgets{speedCombo, dataCombo, parityCombo, stopCombo, flowCombo, group};
+        group->setProperty("_widgets", QVariant::fromValue(static_cast<void*>(w)));
+        return group;
+    };
+
+    // Page 1: CAT cable
+    QWidget* catPage;
+    QLineEdit* catNameEdit;
+    QCheckBox* catEnabledCheck;
+    QLabel*    catStatusLabel;
+    QComboBox* catSourceCombo;
+    QCheckBox* catAutoReportCheck;
+    QGroupBox* catSerialGroup;
+    {
+        catPage = new QWidget;
+        auto* vbox = new QVBoxLayout(catPage);
+        vbox->setSpacing(6);
+
+        // Common header
+        auto* headerGroup = new QGroupBox("Cable Settings");
+        headerGroup->setStyleSheet(kGroupStyle);
+        auto* hg = new QGridLayout(headerGroup);
+        hg->setSpacing(4);
+        hg->addWidget(new QLabel("Name:"), 0, 0);
+        catNameEdit = new QLineEdit;
+        catNameEdit->setStyleSheet(kEdit);
+        hg->addWidget(catNameEdit, 0, 1);
+        catEnabledCheck = new QCheckBox("Enabled");
+        catEnabledCheck->setStyleSheet(kCheck);
+        hg->addWidget(catEnabledCheck, 1, 0, 1, 2);
+        catStatusLabel = new QLabel("Unplugged");
+        catStatusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+        hg->addWidget(new QLabel("Status:"), 2, 0);
+        hg->addWidget(catStatusLabel, 2, 1);
+        vbox->addWidget(headerGroup);
+
+        // Serial params
+        catSerialGroup = makeSerialGroup("Serial Parameters");
+        vbox->addWidget(catSerialGroup);
+
+        // CAT source
+        auto* srcGroup = new QGroupBox("CAT Source");
+        srcGroup->setStyleSheet(kGroupStyle);
+        auto* sg = new QGridLayout(srcGroup);
+        sg->setSpacing(4);
+        sg->addWidget(new QLabel("Source:"), 0, 0);
+        catSourceCombo = makeSourceCombo();
+        sg->addWidget(catSourceCombo, 0, 1);
+        catAutoReportCheck = new QCheckBox("Auto Report");
+        catAutoReportCheck->setStyleSheet(kCheck);
+        sg->addWidget(catAutoReportCheck, 1, 0, 1, 2);
+        vbox->addWidget(srcGroup);
+
+        vbox->addStretch();
+        stack->addWidget(catPage);  // index 1
+    }
+
+    // Page 2: BCD cable
+    QWidget* bcdPage;
+    QLineEdit* bcdNameEdit;
+    QCheckBox* bcdEnabledCheck;
+    QLabel*    bcdStatusLabel;
+    QComboBox* bcdSourceCombo;
+    QComboBox* bcdTypeCombo;
+    QComboBox* bcdPolarityCombo;
+    {
+        bcdPage = new QWidget;
+        auto* vbox = new QVBoxLayout(bcdPage);
+        vbox->setSpacing(6);
+
+        auto* headerGroup = new QGroupBox("Cable Settings");
+        headerGroup->setStyleSheet(kGroupStyle);
+        auto* hg = new QGridLayout(headerGroup);
+        hg->setSpacing(4);
+        hg->addWidget(new QLabel("Name:"), 0, 0);
+        bcdNameEdit = new QLineEdit;
+        bcdNameEdit->setStyleSheet(kEdit);
+        hg->addWidget(bcdNameEdit, 0, 1);
+        bcdEnabledCheck = new QCheckBox("Enabled");
+        bcdEnabledCheck->setStyleSheet(kCheck);
+        hg->addWidget(bcdEnabledCheck, 1, 0, 1, 2);
+        bcdStatusLabel = new QLabel("Unplugged");
+        bcdStatusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+        hg->addWidget(new QLabel("Status:"), 2, 0);
+        hg->addWidget(bcdStatusLabel, 2, 1);
+        vbox->addWidget(headerGroup);
+
+        auto* bcdGroup = new QGroupBox("BCD Settings");
+        bcdGroup->setStyleSheet(kGroupStyle);
+        auto* bg = new QGridLayout(bcdGroup);
+        bg->setSpacing(4);
+        bg->addWidget(new QLabel("BCD Type:"), 0, 0);
+        bcdTypeCombo = new QComboBox;
+        bcdTypeCombo->addItems({"HF (bcd)", "VHF (vbcd)", "HF+VHF (bcd_vbcd)"});
+        bcdTypeCombo->setStyleSheet(kCombo);
+        bg->addWidget(bcdTypeCombo, 0, 1);
+        bg->addWidget(new QLabel("Polarity:"), 1, 0);
+        bcdPolarityCombo = new QComboBox;
+        bcdPolarityCombo->addItems({"Active High", "Active Low"});
+        bcdPolarityCombo->setStyleSheet(kCombo);
+        bg->addWidget(bcdPolarityCombo, 1, 1);
+        bg->addWidget(new QLabel("Source:"), 2, 0);
+        bcdSourceCombo = makeSourceCombo();
+        bg->addWidget(bcdSourceCombo, 2, 1);
+        vbox->addWidget(bcdGroup);
+
+        vbox->addStretch();
+        stack->addWidget(bcdPage);  // index 2
+    }
+
+    // Page 3: Bit cable
+    QWidget* bitPage;
+    QLineEdit* bitNameEdit;
+    QCheckBox* bitEnabledCheck;
+    QLabel*    bitStatusLabel;
+    {
+        bitPage = new QWidget;
+        auto* vbox = new QVBoxLayout(bitPage);
+        vbox->setSpacing(6);
+
+        auto* headerGroup = new QGroupBox("Cable Settings");
+        headerGroup->setStyleSheet(kGroupStyle);
+        auto* hg = new QGridLayout(headerGroup);
+        hg->setSpacing(4);
+        hg->addWidget(new QLabel("Name:"), 0, 0);
+        bitNameEdit = new QLineEdit;
+        bitNameEdit->setStyleSheet(kEdit);
+        hg->addWidget(bitNameEdit, 0, 1);
+        bitEnabledCheck = new QCheckBox("Enabled");
+        bitEnabledCheck->setStyleSheet(kCheck);
+        hg->addWidget(bitEnabledCheck, 1, 0, 1, 2);
+        bitStatusLabel = new QLabel("Unplugged");
+        bitStatusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+        hg->addWidget(new QLabel("Status:"), 2, 0);
+        hg->addWidget(bitStatusLabel, 2, 1);
+        vbox->addWidget(headerGroup);
+
+        // 8-row bit grid
+        auto* bitGroup = new QGroupBox("Bit Configuration (0-7)");
+        bitGroup->setStyleSheet(kGroupStyle);
+        auto* bitGrid = new QGridLayout(bitGroup);
+        bitGrid->setSpacing(2);
+
+        // Header row
+        int col = 0;
+        for (const auto& h : {"Bit", "En", "Source", "Output", "Polarity", "Band"}) {
+            auto* lbl = new QLabel(h);
+            lbl->setStyleSheet("QLabel { color: #8aa8c0; font-size: 10px; font-weight: bold; }");
+            lbl->setAlignment(Qt::AlignCenter);
+            bitGrid->addWidget(lbl, 0, col++);
+        }
+
+        for (int b = 0; b < 8; ++b) {
+            int row = b + 1;
+            auto* bitLabel = new QLabel(QString::number(b));
+            bitLabel->setAlignment(Qt::AlignCenter);
+            bitLabel->setStyleSheet("QLabel { color: #c8d8e8; font-size: 10px; }");
+            bitGrid->addWidget(bitLabel, row, 0);
+
+            auto* enCheck = new QCheckBox;
+            bitGrid->addWidget(enCheck, row, 1, Qt::AlignCenter);
+
+            auto* srcCombo = new QComboBox;
+            srcCombo->addItems({"None", "Active Slice", "TX Slice"});
+            srcCombo->setStyleSheet(kCombo + "QComboBox { font-size: 9px; }");
+            srcCombo->setFixedWidth(90);
+            bitGrid->addWidget(srcCombo, row, 2);
+
+            auto* outCombo = new QComboBox;
+            outCombo->addItems({"band", "freq_range"});
+            outCombo->setStyleSheet(kCombo + "QComboBox { font-size: 9px; }");
+            outCombo->setFixedWidth(80);
+            bitGrid->addWidget(outCombo, row, 3);
+
+            auto* polCombo = new QComboBox;
+            polCombo->addItems({"High", "Low"});
+            polCombo->setStyleSheet(kCombo + "QComboBox { font-size: 9px; }");
+            polCombo->setFixedWidth(50);
+            bitGrid->addWidget(polCombo, row, 4);
+
+            auto* bandEdit = new QLineEdit;
+            bandEdit->setPlaceholderText("e.g. 20");
+            bandEdit->setFixedWidth(50);
+            bandEdit->setStyleSheet(kEdit + "QLineEdit { font-size: 9px; }");
+            bitGrid->addWidget(bandEdit, row, 5);
+
+            // Wire signals to send commands
+            connect(enCheck, &QCheckBox::toggled, this, [cableModel, cableList, b](bool on) {
+                auto* item = cableList->currentItem();
+                if (!item) return;
+                cableModel->sendSetBit(item->data(Qt::UserRole).toString(), b,
+                                       "enable", on ? "1" : "0");
+            });
+            connect(outCombo, &QComboBox::currentTextChanged, this,
+                    [cableModel, cableList, b](const QString& text) {
+                auto* item = cableList->currentItem();
+                if (!item) return;
+                cableModel->sendSetBit(item->data(Qt::UserRole).toString(), b, "output", text);
+            });
+            connect(polCombo, &QComboBox::currentTextChanged, this,
+                    [cableModel, cableList, b](const QString& text) {
+                auto* item = cableList->currentItem();
+                if (!item) return;
+                cableModel->sendSetBit(item->data(Qt::UserRole).toString(), b,
+                                       "polarity", text == "High" ? "active_high" : "active_low");
+            });
+            connect(bandEdit, &QLineEdit::editingFinished, this,
+                    [cableModel, cableList, b, bandEdit]() {
+                auto* item = cableList->currentItem();
+                if (!item) return;
+                cableModel->sendSetBit(item->data(Qt::UserRole).toString(), b,
+                                       "band", bandEdit->text());
+            });
+        }
+
+        vbox->addWidget(bitGroup);
+        vbox->addStretch();
+        stack->addWidget(bitPage);  // index 3
+    }
+
+    // Page 4: Passthrough cable
+    QWidget* ptPage;
+    QLineEdit* ptNameEdit;
+    QCheckBox* ptEnabledCheck;
+    QLabel*    ptStatusLabel;
+    QGroupBox* ptSerialGroup;
+    {
+        ptPage = new QWidget;
+        auto* vbox = new QVBoxLayout(ptPage);
+        vbox->setSpacing(6);
+
+        auto* headerGroup = new QGroupBox("Cable Settings");
+        headerGroup->setStyleSheet(kGroupStyle);
+        auto* hg = new QGridLayout(headerGroup);
+        hg->setSpacing(4);
+        hg->addWidget(new QLabel("Name:"), 0, 0);
+        ptNameEdit = new QLineEdit;
+        ptNameEdit->setStyleSheet(kEdit);
+        hg->addWidget(ptNameEdit, 0, 1);
+        ptEnabledCheck = new QCheckBox("Enabled");
+        ptEnabledCheck->setStyleSheet(kCheck);
+        hg->addWidget(ptEnabledCheck, 1, 0, 1, 2);
+        ptStatusLabel = new QLabel("Unplugged");
+        ptStatusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+        hg->addWidget(new QLabel("Status:"), 2, 0);
+        hg->addWidget(ptStatusLabel, 2, 1);
+        vbox->addWidget(headerGroup);
+
+        ptSerialGroup = makeSerialGroup("Serial Parameters");
+        vbox->addWidget(ptSerialGroup);
+
+        vbox->addStretch();
+        stack->addWidget(ptPage);  // index 4
+    }
+
+    hbox->addWidget(stack, 1);
+
+    // ── Populate cable list from model ──────────────────────────────────
+    auto refreshList = [cableList, cableModel]() {
+        QString prevSn;
+        if (cableList->currentItem())
+            prevSn = cableList->currentItem()->data(Qt::UserRole).toString();
+        cableList->clear();
+        for (auto it = cableModel->cables().begin(); it != cableModel->cables().end(); ++it) {
+            const auto& cable = it.value();
+            QString label = cable.name.isEmpty() ? cable.serialNumber : cable.name;
+            label += QString(" [%1]").arg(cable.type.toUpper());
+            if (!cable.present)
+                label += " (unplugged)";
+            auto* item = new QListWidgetItem(label);
+            item->setData(Qt::UserRole, cable.serialNumber);
+            if (cable.enabled && cable.present)
+                item->setForeground(QColor("#30d050"));
+            else if (cable.enabled)
+                item->setForeground(QColor("#d0d030"));
+            else
+                item->setForeground(QColor("#808080"));
+            cableList->addItem(item);
+            if (cable.serialNumber == prevSn)
+                cableList->setCurrentItem(item);
+        }
+    };
+
+    // ── Select cable → show properties ──────────────────────────────────
+    auto showCableProps = [=](const QString& sn) {
+        if (sn.isEmpty() || !cableModel->cables().contains(sn)) {
+            stack->setCurrentIndex(0);
+            return;
+        }
+        const auto& cable = cableModel->cables()[sn];
+        const QString& t = cable.type;
+
+        if (t == "cat") {
+            stack->setCurrentIndex(1);
+            QSignalBlocker b1(catNameEdit), b2(catEnabledCheck), b3(catSourceCombo), b4(catAutoReportCheck);
+            catNameEdit->setText(cable.name);
+            catEnabledCheck->setChecked(cable.enabled);
+            catStatusLabel->setText(cable.present ? "Plugged In" : "Unplugged");
+            catStatusLabel->setStyleSheet(cable.present
+                ? "QLabel { color: #30d050; font-size: 11px; }"
+                : "QLabel { color: #808080; font-size: 11px; }");
+            catSourceCombo->setCurrentIndex(protoToSource(cable.source));
+            catAutoReportCheck->setChecked(cable.autoReport);
+        } else if (t == "bcd" || t == "vbcd" || t == "bcd_vbcd") {
+            stack->setCurrentIndex(2);
+            QSignalBlocker b1(bcdNameEdit), b2(bcdEnabledCheck), b3(bcdSourceCombo),
+                           b4(bcdTypeCombo), b5(bcdPolarityCombo);
+            bcdNameEdit->setText(cable.name);
+            bcdEnabledCheck->setChecked(cable.enabled);
+            bcdStatusLabel->setText(cable.present ? "Plugged In" : "Unplugged");
+            bcdStatusLabel->setStyleSheet(cable.present
+                ? "QLabel { color: #30d050; font-size: 11px; }"
+                : "QLabel { color: #808080; font-size: 11px; }");
+            bcdSourceCombo->setCurrentIndex(protoToSource(cable.source));
+            if (t == "vbcd") bcdTypeCombo->setCurrentIndex(1);
+            else if (t == "bcd_vbcd") bcdTypeCombo->setCurrentIndex(2);
+            else bcdTypeCombo->setCurrentIndex(0);
+            bcdPolarityCombo->setCurrentIndex(cable.activeHigh ? 0 : 1);
+        } else if (t == "bit") {
+            stack->setCurrentIndex(3);
+            QSignalBlocker b1(bitNameEdit), b2(bitEnabledCheck);
+            bitNameEdit->setText(cable.name);
+            bitEnabledCheck->setChecked(cable.enabled);
+            bitStatusLabel->setText(cable.present ? "Plugged In" : "Unplugged");
+            bitStatusLabel->setStyleSheet(cable.present
+                ? "QLabel { color: #30d050; font-size: 11px; }"
+                : "QLabel { color: #808080; font-size: 11px; }");
+            // Update bit grid rows
+            auto* bitGroup = bitPage->findChild<QGroupBox*>("Bit Configuration (0-7)");
+            // Bit grid cells are updated by index in the grid layout — skip for now,
+            // per-bit UI refresh would iterate the grid children
+        } else if (t == "passthrough") {
+            stack->setCurrentIndex(4);
+            QSignalBlocker b1(ptNameEdit), b2(ptEnabledCheck);
+            ptNameEdit->setText(cable.name);
+            ptEnabledCheck->setChecked(cable.enabled);
+            ptStatusLabel->setText(cable.present ? "Plugged In" : "Unplugged");
+            ptStatusLabel->setStyleSheet(cable.present
+                ? "QLabel { color: #30d050; font-size: 11px; }"
+                : "QLabel { color: #808080; font-size: 11px; }");
+        } else {
+            stack->setCurrentIndex(0);
+        }
+    };
+
+    connect(cableList, &QListWidget::currentItemChanged, this,
+            [showCableProps](QListWidgetItem* current, QListWidgetItem*) {
+        if (current)
+            showCableProps(current->data(Qt::UserRole).toString());
+    });
+
+    // ── Wire model signals ──────────────────────────────────────────────
+    connect(cableModel, &UsbCableModel::cableAdded, this, [refreshList](const QString&) {
+        refreshList();
+    });
+    connect(cableModel, &UsbCableModel::cableRemoved, this, [refreshList, stack](const QString&) {
+        refreshList();
+        stack->setCurrentIndex(0);
+    });
+    connect(cableModel, &UsbCableModel::cableChanged, this,
+            [refreshList, cableList, showCableProps](const QString& sn) {
+        refreshList();
+        if (cableList->currentItem() &&
+            cableList->currentItem()->data(Qt::UserRole).toString() == sn)
+            showCableProps(sn);
+    });
+
+    // ── Wire property edits → commands ──────────────────────────────────
+    // CAT
+    auto sendCatProp = [cableModel, cableList](const QString& key, const QString& val) {
+        auto* item = cableList->currentItem();
+        if (!item) return;
+        cableModel->sendSet(item->data(Qt::UserRole).toString(), key, val);
+    };
+    connect(catNameEdit, &QLineEdit::editingFinished, this, [catNameEdit, sendCatProp]() {
+        sendCatProp("name", QString(catNameEdit->text()).replace(' ', QChar(0x7F)));
+    });
+    connect(catEnabledCheck, &QCheckBox::toggled, this, [sendCatProp](bool on) {
+        sendCatProp("enable", on ? "1" : "0");
+    });
+    connect(catSourceCombo, &QComboBox::currentTextChanged, this,
+            [sendCatProp, sourceToProto](const QString& text) {
+        sendCatProp("source", sourceToProto(text));
+    });
+    connect(catAutoReportCheck, &QCheckBox::toggled, this, [sendCatProp](bool on) {
+        sendCatProp("auto_report", on ? "1" : "0");
+    });
+
+    // BCD
+    auto sendBcdProp = [cableModel, cableList](const QString& key, const QString& val) {
+        auto* item = cableList->currentItem();
+        if (!item) return;
+        cableModel->sendSet(item->data(Qt::UserRole).toString(), key, val);
+    };
+    connect(bcdNameEdit, &QLineEdit::editingFinished, this, [bcdNameEdit, sendBcdProp]() {
+        sendBcdProp("name", QString(bcdNameEdit->text()).replace(' ', QChar(0x7F)));
+    });
+    connect(bcdEnabledCheck, &QCheckBox::toggled, this, [sendBcdProp](bool on) {
+        sendBcdProp("enable", on ? "1" : "0");
+    });
+    connect(bcdTypeCombo, &QComboBox::currentIndexChanged, this,
+            [sendBcdProp](int idx) {
+        static const char* types[] = {"bcd", "vbcd", "bcd_vbcd"};
+        if (idx >= 0 && idx < 3) sendBcdProp("type", types[idx]);
+    });
+    connect(bcdPolarityCombo, &QComboBox::currentIndexChanged, this,
+            [sendBcdProp](int idx) {
+        sendBcdProp("polarity", idx == 0 ? "active_high" : "active_low");
+    });
+    connect(bcdSourceCombo, &QComboBox::currentTextChanged, this,
+            [sendBcdProp, sourceToProto](const QString& text) {
+        sendBcdProp("source", sourceToProto(text));
+    });
+
+    // Bit cable header
+    auto sendBitProp = [cableModel, cableList](const QString& key, const QString& val) {
+        auto* item = cableList->currentItem();
+        if (!item) return;
+        cableModel->sendSet(item->data(Qt::UserRole).toString(), key, val);
+    };
+    connect(bitNameEdit, &QLineEdit::editingFinished, this, [bitNameEdit, sendBitProp]() {
+        sendBitProp("name", QString(bitNameEdit->text()).replace(' ', QChar(0x7F)));
+    });
+    connect(bitEnabledCheck, &QCheckBox::toggled, this, [sendBitProp](bool on) {
+        sendBitProp("enable", on ? "1" : "0");
+    });
+
+    // Passthrough
+    auto sendPtProp = [cableModel, cableList](const QString& key, const QString& val) {
+        auto* item = cableList->currentItem();
+        if (!item) return;
+        cableModel->sendSet(item->data(Qt::UserRole).toString(), key, val);
+    };
+    connect(ptNameEdit, &QLineEdit::editingFinished, this, [ptNameEdit, sendPtProp]() {
+        sendPtProp("name", QString(ptNameEdit->text()).replace(' ', QChar(0x7F)));
+    });
+    connect(ptEnabledCheck, &QCheckBox::toggled, this, [sendPtProp](bool on) {
+        sendPtProp("enable", on ? "1" : "0");
+    });
+
+    // Initial populate
+    refreshList();
+
+    return page;
+}
+
 #ifdef HAVE_SERIALPORT
 QWidget* RadioSetupDialog::buildSerialTab()
 {
@@ -2013,6 +2739,141 @@ QWidget* RadioSetupDialog::buildSerialTab()
             s.save();
         });
         vbox->addWidget(autoOpen);
+    }
+
+    // ── FlexControl tuning knob ────────────────────────────────────────
+    {
+        auto* group = new QGroupBox("FlexControl Tuning Knob");
+        group->setStyleSheet(kGroupStyle);
+        auto* grid = new QGridLayout(group);
+        grid->setSpacing(6);
+
+        // Status
+        auto* fcStatusLabel = new QLabel("Not detected");
+        fcStatusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+        grid->addWidget(new QLabel("Status:"), 0, 0);
+        grid->addWidget(fcStatusLabel, 0, 1);
+
+        // Detect / Close buttons
+        auto* fcDetectBtn = new QPushButton("Detect");
+        fcDetectBtn->setFixedWidth(80);
+        fcDetectBtn->setStyleSheet(
+            "QPushButton { background: #00b4d8; color: #0f0f1a; font-weight: bold; "
+            "border: 1px solid #008ba8; padding: 3px; border-radius: 3px; }"
+            "QPushButton:hover { background: #00c8f0; }");
+        auto* fcCloseBtn = new QPushButton("Close");
+        fcCloseBtn->setFixedWidth(80);
+        fcCloseBtn->setStyleSheet(fcDetectBtn->styleSheet());
+        fcCloseBtn->setEnabled(false);
+
+        auto* btnRow = new QHBoxLayout;
+        btnRow->addWidget(fcDetectBtn);
+        btnRow->addWidget(fcCloseBtn);
+        btnRow->addStretch();
+        grid->addLayout(btnRow, 0, 2);
+
+        // Update status display
+        auto updateFcStatus = [fcStatusLabel, fcCloseBtn, fcDetectBtn]
+                              (bool connected, const QString& port = {}) {
+            if (connected) {
+                fcStatusLabel->setText(QString("Connected (%1)").arg(port));
+                fcStatusLabel->setStyleSheet("QLabel { color: #30d050; font-size: 11px; }");
+                fcCloseBtn->setEnabled(true);
+                fcDetectBtn->setEnabled(false);
+            } else {
+                fcStatusLabel->setText("Not detected");
+                fcStatusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+                fcCloseBtn->setEnabled(false);
+                fcDetectBtn->setEnabled(true);
+            }
+        };
+
+        connect(fcDetectBtn, &QPushButton::clicked, this, [updateFcStatus] {
+            QString port = FlexControlManager::detectPort();
+            if (port.isEmpty()) {
+                updateFcStatus(false);
+                return;
+            }
+            updateFcStatus(true, port);
+            // Store port for MainWindow to open
+            auto& s = AppSettings::instance();
+            s.setValue("FlexControlPort", port);
+            s.setValue("FlexControlOpen", "True");
+            s.save();
+        });
+        connect(fcCloseBtn, &QPushButton::clicked, this, [updateFcStatus] {
+            updateFcStatus(false);
+            auto& s = AppSettings::instance();
+            s.setValue("FlexControlOpen", "False");
+            s.save();
+        });
+
+        // Show current state from settings
+        if (settings.value("FlexControlOpen", "False").toString() == "True") {
+            QString port = settings.value("FlexControlPort").toString();
+            if (!port.isEmpty())
+                updateFcStatus(true, port);
+        }
+
+        // Button action configuration
+        static const QStringList actions = {
+            "None", "StepUp", "StepDown", "ToggleMox",
+            "ToggleTune", "ToggleMute", "ToggleLock",
+            "NextSlice", "PrevSlice"
+        };
+        static const char* defaultActions[3][2] = {
+            {"StepUp", "StepDown"},
+            {"ToggleMox", "ToggleTune"},
+            {"ToggleMute", "ToggleLock"},
+        };
+        static const char* btnLabels[3] = {"Button 1:", "Button 2:", "Button 3:"};
+        static const char* actLabels[2] = {"Tap", "Double"};
+
+        for (int b = 0; b < 3; ++b) {
+            grid->addWidget(new QLabel(btnLabels[b]), b + 1, 0);
+            auto* row = new QHBoxLayout;
+            for (int a = 0; a < 2; ++a) {
+                row->addWidget(new QLabel(actLabels[a]));
+                auto* combo = new QComboBox;
+                combo->addItems(actions);
+                combo->setStyleSheet(QString(kEditStyle).replace("QLineEdit", "QComboBox"));
+                QString key = QString("FlexControlBtn%1Action%2").arg(b + 1).arg(a);
+                QString current = settings.value(key, defaultActions[b][a]).toString();
+                int idx = actions.indexOf(current);
+                if (idx >= 0) combo->setCurrentIndex(idx);
+                connect(combo, &QComboBox::currentTextChanged, this, [key](const QString& text) {
+                    auto& s = AppSettings::instance();
+                    s.setValue(key, text);
+                    s.save();
+                });
+                row->addWidget(combo);
+            }
+            row->addStretch();
+            grid->addLayout(row, b + 1, 1, 1, 2);
+        }
+
+        // Auto-detect checkbox
+        auto* autoDetect = new QCheckBox("Auto-detect on startup");
+        autoDetect->setStyleSheet("QCheckBox { color: #c8d8e8; }");
+        autoDetect->setChecked(settings.value("FlexControlAutoDetect", "True").toString() == "True");
+        connect(autoDetect, &QCheckBox::toggled, this, [](bool on) {
+            auto& s = AppSettings::instance();
+            s.setValue("FlexControlAutoDetect", on ? "True" : "False");
+            s.save();
+        });
+        grid->addWidget(autoDetect, 4, 0, 1, 3);
+
+        auto* invertDir = new QCheckBox("Invert tuning direction");
+        invertDir->setStyleSheet("QCheckBox { color: #c8d8e8; }");
+        invertDir->setChecked(settings.value("FlexControlInvertDir", "False").toString() == "True");
+        connect(invertDir, &QCheckBox::toggled, this, [](bool on) {
+            auto& s = AppSettings::instance();
+            s.setValue("FlexControlInvertDir", on ? "True" : "False");
+            s.save();
+        });
+        grid->addWidget(invertDir, 5, 0, 1, 3);
+
+        vbox->addWidget(group);
     }
 
     vbox->addStretch();

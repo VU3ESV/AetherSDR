@@ -2,6 +2,7 @@
 #include "ComboStyle.h"
 #include "HGauge.h"
 #include "models/TransmitModel.h"
+#include "core/AppSettings.h"
 
 #include <QPushButton>
 #include <QLabel>
@@ -52,23 +53,7 @@ private:
     Dir m_dir;
 };
 
-// ── Shared gradient title bar (matches AppletPanel / TxApplet style) ─────────
 
-static QWidget* appletTitleBar(const QString& text)
-{
-    auto* bar = new QWidget;
-    bar->setFixedHeight(16);
-    bar->setStyleSheet(
-        "QWidget { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-        "stop:0 #3a4a5a, stop:0.5 #2a3a4a, stop:1 #1a2a38); "
-        "border-bottom: 1px solid #0a1a28; }");
-
-    auto* lbl = new QLabel(text, bar);
-    lbl->setStyleSheet("QLabel { background: transparent; color: #8aa8c0; "
-                       "font-size: 10px; font-weight: bold; }");
-    lbl->setGeometry(6, 1, 240, 14);
-    return bar;
-}
 
 // ── Style constants ──────────────────────────────────────────────────────────
 
@@ -117,9 +102,6 @@ PhoneCwApplet::PhoneCwApplet(QWidget* parent)
     auto* outer = new QVBoxLayout(this);
     outer->setContentsMargins(0, 0, 0, 0);
     outer->setSpacing(0);
-
-    // Shared title bar
-    outer->addWidget(appletTitleBar("P/CW"));
 
     // Stacked widget holding Phone (index 0) and CW (index 1) panels
     m_stack = new QStackedWidget;
@@ -208,6 +190,7 @@ void PhoneCwApplet::buildPhonePanel()
             m_micLevelLabel->setText(QString::number(v));
             if (!m_updatingFromModel && m_model)
                 m_model->setMicLevel(v);
+            emit micLevelChanged(v);
         });
 
         connect(m_accBtn, &QPushButton::toggled, this, [this](bool on) {
@@ -615,8 +598,15 @@ void PhoneCwApplet::syncPhoneFromModel()
         if (idx >= 0) m_micSourceCombo->setCurrentIndex(idx);
     }
 
-    m_micLevelSlider->setValue(m_model->micLevel());
-    m_micLevelLabel->setText(QString::number(m_model->micLevel()));
+    // PC mic gain is client-authoritative (radio always returns mic_level=0 for PC)
+    if (m_model->micSelection() == "PC") {
+        int pcGain = AppSettings::instance().value("PcMicGain", 100).toInt();
+        m_micLevelSlider->setValue(pcGain);
+        m_micLevelLabel->setText(QString::number(pcGain));
+    } else {
+        m_micLevelSlider->setValue(m_model->micLevel());
+        m_micLevelLabel->setText(QString::number(m_model->micLevel()));
+    }
     m_accBtn->setChecked(m_model->micAcc());
     m_procBtn->setChecked(m_model->speechProcessorEnable());
 
@@ -671,26 +661,26 @@ void PhoneCwApplet::updateMeters(float micLevel, float compLevel,
                                   float micPeak, float compPeak)
 {
     Q_UNUSED(compLevel);
+    Q_UNUSED(compPeak);
 
     // Suppress mic meter when met_in_rx is off and not transmitting
     if (m_model && !m_model->metInRx() && !m_model->isTransmitting()) {
         m_levelGauge->setValue(-150.0f);
         m_levelGauge->setPeakValue(-150.0f);
-        m_compGauge->setValue(0.0f);
         return;
     }
 
     m_levelGauge->setValue(micLevel);
     m_levelGauge->setPeakValue(micPeak);
+    // Compression gauge is now driven exclusively by updateCompression()
+}
 
-    float comp = (compPeak < -30.0f || compPeak >= 0.0f) ? 0.0f : compPeak;
-
-    if (comp < m_compHeld) {
-        m_compHeld = comp;
-    } else {
-        m_compHeld = qMin(0.0f, m_compHeld + kCompDecayRate);
-    }
-    m_compGauge->setValue(m_compHeld);
+void PhoneCwApplet::updateCompression(float compPeak)
+{
+    // TODO (#345): Compression meter disabled — raw COMPPEAK reads as a reversed
+    // level meter, not gain reduction. Need to determine correct gain reduction
+    // calculation. See docs/tx-audio-signal-path.md for meter details.
+    Q_UNUSED(compPeak);
 }
 
 void PhoneCwApplet::updateAlc(float alc)

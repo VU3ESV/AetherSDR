@@ -11,14 +11,14 @@ PanadapterModel::PanadapterModel(const QString& panId, QObject* parent)
 quint32 PanadapterModel::panStreamId() const
 {
     bool ok = false;
-    quint32 id = m_panId.toUInt(&ok, 16);
+    quint32 id = m_panId.toUInt(&ok, 0);  // base 0: auto-detect 0x prefix
     return ok ? id : 0;
 }
 
 quint32 PanadapterModel::wfStreamId() const
 {
     bool ok = false;
-    quint32 id = m_waterfallId.toUInt(&ok, 16);
+    quint32 id = m_waterfallId.toUInt(&ok, 0);  // base 0: auto-detect 0x prefix
     return ok ? id : 0;
 }
 
@@ -58,9 +58,14 @@ void PanadapterModel::applyPanStatus(const QMap<QString, QString>& kvs)
     }
     if (kvs.contains("rfgain")) {
         int g = kvs["rfgain"].toInt();
-        QString pre = kvs.value("pre", m_preamp);
-        if (g != m_rfGain || pre != m_preamp) {
+        if (g != m_rfGain) {
             m_rfGain = g;
+            emit rfGainChanged(m_rfGain, m_preamp);
+        }
+    }
+    if (kvs.contains("pre")) {
+        QString pre = kvs["pre"];
+        if (pre != m_preamp) {
             m_preamp = pre;
             emit rfGainChanged(m_rfGain, m_preamp);
         }

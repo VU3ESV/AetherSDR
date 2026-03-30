@@ -33,7 +33,7 @@ cmake --build build -j$(nproc)
 
 Dependencies (Arch): `qt6-base qt6-multimedia cmake ninja pkgconf autoconf automake libtool`
 
-Current version: **0.5.7** (set in both `CMakeLists.txt` and `README.md`).
+Current version: **0.7.12** (set in both `CMakeLists.txt` and `README.md`).
 
 ---
 
@@ -62,6 +62,9 @@ src/
 │   ├── PipeWireAudioBridge — Linux DAX: PulseAudio pipe modules (4 RX + 1 TX)
 │   ├── VirtualAudioBridge  — macOS DAX: CoreAudio HAL plugin shared memory bridge
 │   ├── SerialPortController— USB-serial PTT/CW keying (DTR/RTS out, CTS/DSR in)
+│   ├── FlexControlManager  — FlexControl USB tuning knob (VID 0x2192, 9600 8N1)
+│   ├── MidiControlManager  — MIDI controller mapping (RtMidi, Learn mode, 50+ params)
+│   ├── MidiSettings        — Dedicated XML settings for MIDI bindings (~/.config/AetherSDR/midi.settings)
 │   ├── OpusCodec           — Opus encode/decode for SmartLink WAN audio compression
 │   ├── LogManager          — Per-module Qt Logging Categories with persistence
 │   ├── SupportBundle       — Collect logs+settings+sysinfo into tar.gz/zip for bug reports
@@ -77,6 +80,8 @@ src/
 │   ├── EqualizerModel      — 8-band EQ state for TX and RX (eq txsc / eq rxsc)
 │   ├── TunerModel          — 4o3a Tuner Genius XL state (relays, SWR, tuning)
 │   ├── TnfModel            — Tracking notch filter management (add/remove/drag)
+│   ├── UsbCableModel       — USB cable management (CAT/BCD/Bit/Passthrough)
+│   ├── DaxIqModel          — DAX IQ stream state (4 channels, worker thread, PulseAudio pipes)
 │   ├── BandSettings        — Per-band persistent settings
 │   └── AntennaGeniusModel  — 4o3a Antenna Genius switch state
 └── gui/
@@ -102,7 +107,10 @@ src/
     ├── RadioSetupDialog    — Radio setup (9 tabs): Radio, Network, GPS, Audio, TX, etc.
     ├── MemoryDialog        — Memory channel manager with editable name column
     ├── ProfileManagerDialog— Global/TX/mic profile management
+    ├── MidiMappingDialog   — MIDI controller binding manager (Learn mode, profiles)
     ├── SpotSettingsDialog   — Spot/DX cluster settings
+    ├── SpotHubDialog        — Unified spot manager (6 tabs: DX Cluster, RBN, WSJT-X, POTA, Spot List, Display)
+    ├── SpotDensityBadge     — Clickable spot count badge with expand-to-list popup
     ├── NetworkDiagnosticsDialog — SmartLink network diagnostics
     ├── MeterSlider         — Combined level meter + gain slider widget (DAX channels)
     ├── HGauge.h            — Shared horizontal gauge widget (header-only)
@@ -174,6 +182,10 @@ first `=` sign.
 - Slice frequency is `RF_frequency` (not `freq`) in status messages
 - All VITA-49 streams use `ExtDataWithStream` (type 3, top nibble `0x3`)
 - Streams are discriminated by **PacketClassCode** (PCC), NOT by packet type
+- `slice m <freq> pan=<panId>` — the radio echoes `active=0/1` for slice
+  switching as a side effect, even though the client didn't request it
+- `radio set full_duplex_enabled` — accepted (R|0) but no status echo
+- `audio_level` is the status key for AF gain (not `audio_gain`)
 
 ---
 
@@ -195,11 +207,16 @@ Words 0–6 of the VITA-49 header. Key field: **PCC** in lower 16 bits of word 3
 
 ### FFT Bin Conversion
 
+The radio encodes FFT bin values as **pixel Y positions** (0 = top/max_dbm,
+ypixels-1 = bottom/min_dbm), NOT as 0-65535 uint16 range:
+
 ```
-dBm = min_dbm + (sample / 65535.0) × (max_dbm − min_dbm)
+dBm = max_dbm - (sample / (y_pixels - 1.0)) × (max_dbm − min_dbm)
 ```
 
 `min_dbm` / `max_dbm` come from `display pan` status messages (typically -135 / -40).
+`y_pixels` comes from `display pan` status (must be tracked per-stream via
+`PanadapterStream::setYPixels()`).
 
 ### FFT Frame Assembly
 
@@ -338,6 +355,39 @@ bool on = s.value("MyFeatureEnabled", "False").toString() == "True";
 The only place `QSettings` appears is in `AppSettings.cpp` for one-time
 migration from the old INI format.
 
+### Radio-Authoritative Settings Policy
+
+**The radio is always authoritative for any setting it stores.** AetherSDR
+must never save, recall, or override radio-side settings from client-side
+persistence. Only save client-side settings for things the radio does NOT
+save.
+
+**Radio-authoritative (do NOT persist client-side):**
+- Frequency, mode, filter width (restored via GUIClientID session)
+- Step size and step list (per-slice, per-mode — sent via `step=` / `step_list=` in slice status)
+- AGC mode/threshold, squelch, DSP flags (NR, NB, ANF, etc.)
+- Antenna assignments (RX/TX antenna per slice)
+- TX power, tune power, mic settings
+- Panadapter count and slice assignments (radio restores from GUIClientID)
+- Any setting that appears in a `slice`, `transmit`, or `display pan` status message
+
+**Client-authoritative (persist in AppSettings):**
+- Panadapter layout arrangement (how pans are arranged on screen — 2v, 2h, etc.)
+- Client-side DSP (NR2, RN2 — not known to radio)
+- UI preferences (window geometry, applet visibility, UI scale)
+- Display preferences (FFT fill color/alpha, waterfall color scheme)
+- CWX panel visibility, keyboard shortcuts enabled
+- Band stack display settings (dBm scale — per-pan display preference, not
+  radio state). NOTE: bandwidth/center are radio-authoritative — do NOT
+  persist or restore them (see #291).
+- DX spot settings (colors, font size, opacity)
+
+**Why:** When both the radio and client persist the same setting, they fight
+on reconnect. The radio restores its value via GUIClientID, then the client
+overwrites it with a stale saved value. This caused bugs with step size (#274),
+filter offsets, and panadapter layout (#269). The radio's session restore is
+always more current than our saved state.
+
 ### GUI↔Radio Sync (No Feedback Loops)
 
 - `SliceModel` setters emit `commandReady(cmd)` → `RadioModel` sends to radio
@@ -388,24 +438,28 @@ lacks status feedback and the expected status message format.
 
 ---
 
-## Multi-Panadapter Support (In Progress — #152)
+## Multi-Panadapter Support (#152)
 
-### Architecture (Phases 1-7 complete)
+### Architecture
 
-The multi-pan infrastructure is in place:
 - **PanadapterModel** — per-pan state (center, bandwidth, dBm, antenna, WNB)
 - **PanadapterStream** — routes VITA-49 FFT/waterfall by stream ID
-- **PanadapterStack** — vertical QSplitter hosting N PanadapterApplets
-- **wirePanadapter()** — per-pan signal wiring extracted from constructor
+- **PanadapterStack** — nested QSplitter hosting N PanadapterApplets
+- **PanLayoutDialog** — visual layout picker (6 layouts for dual-SCU, 3 for single)
+- **wirePanadapter()** — per-pan signal wiring (display controls, overlays, click-to-tune)
 - **spectrumForSlice()** — routes slice overlays/VFOs to correct SpectrumWidget
-- **+PAN button** — uses `display panafall create x=100 y=100` (NOT `panadapter create`)
 
 ### What Works
-- Creating a second panadapter via +PAN button
-- Independent FFT/waterfall on each pan
-- Independent zoom/pan/center per pan
-- Click-to-tune correctly activates the clicked pan's slice
-- VFO flag deconfliction across pans
+- All 6 layout options: single, 2v, 2h, 2h1 (A|B/C), 12h (A/B|C), 2x2 (A|B/C|D)
+- Per-pan native waterfall tiles correctly routed by wfStreamId
+- Per-pan FFT correctly routed by panStreamId
+- Per-pan dBm scaling
+- Per-pan display controls (AVG, FPS, fill, gain, black level, line duration, etc.)
+- Per-pan xpixels/ypixels pushed on creation
+- Click-to-tune via `slice m <freq> pan=<panId>` (SmartSDR protocol)
+- Independent tuning per pan
+- Client-side auto-black per-pan
+- Layout picker persists choice in AppSettings
 
 ### VFO Frequency Sync — RESOLVED
 
@@ -447,6 +501,33 @@ We investigated `client gui <uuid>` as a way to mirror another client's session
 
 See issue #146 (closed) for full analysis.
 
+### Protocol Findings (from SmartSDR pcap capture)
+
+**Click-to-tune:** SmartSDR uses `slice m <freq> pan=<panId>` — NOT
+`slice tune <freq>`. The `pan=` parameter tells the radio which panadapter
+the click occurred in. The radio routes the tune to the correct slice.
+SmartSDR **never sends `slice set <id> active=1`** — active slice is managed
+entirely client-side.
+
+**Per-pan dimensions:** SmartSDR sends `display pan set <panId> xpixels=<W>
+ypixels=<H>` immediately after creating each pan, using actual widget
+dimensions. Without this, the radio defaults to xpixels=50 ypixels=20 and
+FFT data is essentially empty. SmartSDR also resizes ypixels on both pans
+when the layout changes.
+
+**Keepalive:** SmartSDR sends `keepalive enable` on connect, then
+`ping ms_timestamp=<ms>` every 1 second. The radio responds with `R<seq>|0|`.
+
+**Display settings are per-pan:** Each pan has independent fps, average,
+weighted_average, color_gain, black_level, line_duration. Commands use the
+specific pan's ID: `display pan set 0x40000001 fps=25`. Waterfall settings
+use the waterfall ID: `display panafall set 0x42000001 black_level=15`.
+
+**Stream IDs:** FFT bins arrive with stream ID = pan ID (0x40xxxxxx, PCC
+0x8003). Waterfall tiles arrive with stream ID = waterfall ID (0x42xxxxxx,
+PCC 0x8004). These are DIFFERENT IDs — route waterfall by `wfStreamId()`,
+FFT by `panStreamId()`.
+
 ### Protocol Notes for +PAN
 
 - `panadapter create` — returns `0x50000015` (use `display panafall create` instead)
@@ -456,11 +537,107 @@ See issue #146 (closed) for full analysis.
 - `radio slices=N panadapters=N` — these count DOWN (available slots, not in-use)
 - FLEX-8600 (dual SCU): max 4 pans, max 4 slices
 
-### +PAN Button Status
+### Multi-Pan Implementation Pitfalls (lessons learned)
 
-**Currently DISABLED** in the event filter (`MainWindow::eventFilter`).
-The button is visible in the status bar but clicking it does nothing.
-Re-enable after VFO tracking and focus switching issues are resolved.
+1. **`QString::toUInt("0x40000001", 16)` returns 0.** Qt's `toUInt` with
+   explicit base 16 does NOT handle the `0x` prefix. Use base 0 (auto-detect).
+   This silently broke all stream ID comparisons.
+
+2. **`handlePanadapterStatus()` must dispatch by panId.** The `display pan`
+   status object name contains the pan ID — pass it through. Never apply pan
+   status to `activePanadapter()` unconditionally.
+
+3. **Waterfall ID arrives AFTER pan creation.** The `display pan` status
+   message contains `waterfall=0x42xxxxxx` but it arrives after the
+   PanadapterModel is created. Connect `waterfallIdChanged` to
+   `updateStreamFilters()` to register the wf stream when it arrives.
+
+4. **Don't force-associate waterfalls to pans.** The radio's `display pan`
+   status correctly sets `waterfallId` via `applyPanStatus`. Manual
+   association logic assigns to the wrong pan (first-empty-slot race).
+
+5. **Display overlay connections must be per-pan.** Wire each
+   PanadapterApplet's overlay menu in `wirePanadapter()`, not globally in
+   the constructor. Each overlay sends commands with its own panId/waterfallId.
+
+6. **Push `xpixels`/`ypixels` to each new pan on creation.** The radio
+   defaults to `xpixels=50 ypixels=20` which produces empty FFT bins.
+   Send actual widget dimensions immediately after `panadapterAdded`.
+
+7. **Never send `slice set <id> active=1`.** Active slice is managed
+   entirely client-side. The radio bounces `active` between slices when
+   two share a pan, creating infinite feedback loops. See pitfall #16.
+
+8. **Use `slice m <freq> pan=<panId>` for cross-pan click-to-tune only.**
+   For same-pan tuning (scroll wheel, click on active slice's pan), use
+   `onFrequencyChanged()` → `slice tune <sliceId>`. See pitfall #18.
+   `slice m` does NOT recenter the pan when crossing band boundaries.
+
+9. **Band changes need `slice tune` + `slice m`.** `slice tune <id> <freq>`
+   recenters the pan's FFT/waterfall on the new band. `slice m <freq>
+   pan=<panId>` updates the VFO frequency. Both are needed for a complete
+   cross-band change in multi-pan mode. In single-pan mode, use
+   `onFrequencyChanged()` which handles everything.
+
+10. **Band change handler must target the pan's slice, not `activeSlice()`.**
+    Use `sl->panId() == applet->panId()` to find the correct slice for each
+    pan's overlay. Falling back to `activeSlice()` causes all band changes
+    to affect slice A.
+
+11. **Band stack save must validate frequency vs band.** In multi-pan mode,
+    the save handler's `activeSlice()` may return a slice on a different band.
+    Use `BandSettings::bandForFrequency()` to verify the frequency belongs to
+    the band before saving. Skip the save if they don't match (prevents
+    cross-band contamination).
+
+12. **Disconnect dying pan widgets before removal.** When a pan is removed
+    (layout reduction), disconnect all signals from its SpectrumWidget and
+    OverlayMenu to MainWindow BEFORE the widget is destroyed. This prevents
+    all `wirePanadapter` lambdas from calling into dead objects. One-shot
+    global fix — covers all current and future lambdas.
+
+13. **Preamp (`pre=`) is shared antenna hardware.** When any `display pan`
+    status contains `pre=`, apply it to ALL pans sharing the same antenna,
+    not just the pan the status belongs to. Multi-Flex filtering must not
+    block preamp updates — they are SCU-level state, not per-client.
+
+14. **Filter polarity normalization.** The radio sometimes sends wrong-polarity
+    filter offsets after session restore (e.g. `filter_lo=-2700 filter_hi=0`
+    for DIGU). Normalize in `applyStatus()` based on mode: USB/DIGU/FDV must
+    have `filterLo >= 0`, LSB/DIGL must have `filterHi <= 0`.
+
+15. **`FWDPWR` meter source is `TX-` (with trailing dash), not `TX`.**
+    Use `startsWith("TX")` for matching, not exact equality.
+
+16. **Never send `slice set <id> active=1` — not even in single-pan mode.**
+    The radio bounces `active` between slices when two share a pan, creating
+    an infinite feedback loop (slice 0 active → we send active=1 for 0 →
+    radio sets slice 1 active → we react → loop). SmartSDR manages active
+    entirely client-side. The radio sets `active=` as a side-effect of
+    `slice m` commands. Removed `s->setActive(true)` from `setActiveSlice()`
+    entirely.
+
+17. **`activePanChanged` must sync ALL slice-dependent UI.** In multi-pan mode,
+    `setActiveSlice()` does NOT fire on pan click (pitfall #7). So step size,
+    CW decode, applet panel controls, and overlay menu slice binding must all
+    be synced in the `activePanChanged` handler. Use `setActivePanApplet()`
+    to rewire CW decoder connections.
+
+18. **Click-to-tune must not switch slices within the same pan.** The
+    `frequencyClicked` handler should only switch active slice when clicking
+    on a DIFFERENT pan. When multiple slices share a pan, always tune the
+    current active slice via `onFrequencyChanged()` → `slice tune`. Switching
+    to the other slice on each scroll event causes both VFOs to move.
+
+19. **+RX must target the button's own pan, not `m_activePanId`.** The
+    `addRxClicked` signal must carry the panId from `SpectrumOverlayMenu`.
+    Use `RadioModel::addSliceOnPan(panId)` with explicit panId in the
+    `slice create pan=<panId>` command.
+
+20. **`setActivePanApplet()` rewires CW decoder.** When the active pan
+    changes, disconnect `textDecoded`/`statsUpdated`/pitch/speed signals
+    from the old applet and reconnect to the new one. The CW decoder is
+    a singleton — its output must follow the active pan.
 
 ---
 
@@ -526,7 +703,7 @@ and panadapter. The radio assigns these to our `client_handle`.
 
 ---
 
-## What's Implemented (v0.5.7)
+## What's Implemented (v0.6.0)
 
 - UDP radio discovery and TCP command/control
 - SmartSDR V/H/R/S/M protocol parsing
@@ -575,7 +752,10 @@ and panadapter. The radio assigns these to our `client_handle`.
 - **r8brain-free-src resampling**: professional polyphase resampler replacing all
   hand-rolled sample rate conversion (AudioEngine, RNNoiseFilter, RADEEngine)
 - PC audio toggle button (radio line out vs PC speakers)
-- Audio TX (mic → VITA-49 float32 stereo, PC audio TX via DAX)
+- Audio TX: PC mic → Opus stereo 10ms → VITA-49 on remote_audio_tx (voice),
+  DAX TX → uncompressed float32 on dax_tx (digital modes).
+  Client-side PC mic gain (0-100%), client-side mic level metering with
+  VU ballistics, VOX support via met_in_rx=1
 - 48kHz audio fallback for devices that don't support 24kHz
 - TNF management: add/drag/right-click/width/depth, permanent vs temporary
 - CAT control: 4-channel rigctld TCP + PTY virtual serial ports
@@ -658,18 +838,184 @@ and panadapter. The radio assigns these to our `client_handle`.
 - **macOS mic permission**: proper AVAuthorizationStatus check with diagnostic
   logging (#157)
 - **NR2/RN2 button sync**: overlay ↔ VFO ↔ RX applet all stay in sync
+- **NR2 freeze fix**: spectrum overlay NR2 toggle now uses wisdom-gated
+  background thread (was freezing UI on first enable) (#214)
+- **NR2/RN2 persistence**: client-side DSP state saved on exit, restored
+  on launch (#167)
+- **VFO TX badge toggle**: click to assign OR unassign TX (#213)
+- **TGXL OPERATE disables TUNE/ATU/MEM**: TX applet buttons dimmed when
+  external tuner is in OPERATE mode, re-enabled in BYPASS/STANDBY (#197)
+- **Reconnect dialog**: "Radio disconnected — Waiting for reconnect" on
+  unexpected disconnect with Disconnect button, auto-close on reconnect (#209)
+- **Fast disconnect detection**: discovery stale timeout reduced to 5s,
+  force-disconnect on radio loss instead of waiting for TCP timeout (#209)
+- **Repeating reconnect timer**: retries TCP connect every 5s instead of
+  single-shot, alongside discovery-based auto-connect (#209)
+- **Heartbeat indicator**: title bar circle flashes green on each TCP ping
+  response, blinks red/grey after 3 missed beats
+- **Keepalive ping**: sends `keepalive enable` + 1s ping timer (matches
+  FlexLib), drives heartbeat for local/routed/SmartLink connections
+- **Low Bandwidth Connect**: connection panel checkbox sends
+  `client low_bw_connect` to reduce FFT/waterfall data for VPN/LTE links
+- **PA inhibit during TUNE**: opt-in safety feature disables ACC TX output
+  before tune, restores after completion, protects external amplifiers (#156)
+- **Exciter power fix with PGXL**: FWDPWR meter now filtered by source "TX"
+  so amplifier meter doesn't overwrite exciter reading (#181)
+- **Step size persistence**: tuning step saved/restored across restarts (#211)
+- **VFO slider value labels**: AF gain, SQL, AGC-T show numeric values (#198)
+- **DVK (Digital Voice Keyer)**: 12-slot recording/playback panel with F1-F12
+  hotkeys, REC/STOP/PLAY/PREV buttons, elapsed timer with progress bars,
+  right-click context menu (rename, clear, delete, import/export WAV),
+  inline name editing, WAV upload/download via TCP (#19)
+- **DVK mode-aware availability**: DVK enabled only in voice modes (USB/LSB/
+  AM/SAM/FM/NFM/DFM), CWX enabled only in CW/CWL. Auto-close on mode switch.
+  Mutual exclusion between CWX and DVK panels.
+- **FFT/waterfall horizontal alignment fix**: removed hardcoded xpixels=1024
+  that overwrote correct widget dimensions, fixing signal position mismatch
+  between FFT spectrum and native waterfall tiles (#279)
+- **FFT dBm calibration**: bin conversion now uses actual ypixels from radio
+  status (bins are pixel Y positions, not 0-65535 range). Tracks y_pixels
+  from radio status updates for correct dBm scaling.
+- **Title bar speaker mute fix**: mute button now controls local PC audio
+  engine in addition to radio line out (#259)
+- **VFO mute indicator**: speaker icon on VFO tab bar toggles 🔊/🔇 to
+  reflect mute state. Right-click speaker tab to toggle mute directly (#283)
+- **4-pane splitter fix**: CWX+DVK+PanStack+AppletPanel layout corrected —
+  applet panel was invisible due to wrong stretch/size indices (#281)
+- **VOX support**: creates `remote_audio_tx` stream on connect, streams mic
+  audio to radio during RX for VOX detection (`met_in_rx=1`). Separate
+  accumulator keeps VOX path independent from DAX TX (#253)
+- **Profile load xpixels fix**: detect when radio resets x/y_pixels to
+  defaults during profile load and auto re-push correct widget dimensions (#289)
+- **Band stack radio-authoritative fix**: removed bandwidth and center from
+  band stack save/restore — both are radio-authoritative per FlexLib API.
+  Fixes FFT/waterfall misalignment on band change (#291)
+- **ESC (Enhanced Signal Clarity)**: diversity beamforming controls in VFO
+  audio tab. Polar display (phase=angle, gain=radius), horizontal phase
+  slider (0–360° in 5° steps, radians to radio), vertical gain slider
+  (0.0–2.0), ESC toggle button. Real-time ESC signal strength meter bar
+  from radio SLC/ESC meter. Protocol matches SmartSDR pcap: `esc=on/off`,
+  phase in radians, DiversityChild guard per FlexLib. ESC panel visible
+  only on diversity parent slice, hidden on child. Requires DIV_ESC
+  license (SmartSDR+). (#20, #38)
+- **Band change panadapter scroll fix**: band changes now use
+  `tuneAndRecenter()` instead of `onFrequencyChanged()` which sent
+  `autopan=0`, preventing the radio from scrolling to the new band
+- **NVIDIA NIM BNR (Background Noise Removal)**: GPU-accelerated neural
+  audio denoising via self-hosted Docker container. gRPC bidirectional
+  streaming (48kHz mono float32, 10ms chunks). Async worker thread for
+  all gRPC I/O, jitter buffer (50ms priming) for smooth playback.
+  Intensity slider (0–100%) in overlay DSP panel. BNR button in VFO DSP
+  tab and overlay menu, 3-way mutual exclusion with NR2/RN2.
+  Radio Setup → Audio: container management panel (autostart, start/stop,
+  status indicator). Requires NVIDIA RTX 4000+ GPU + Docker. (#288)
+- **Band zoom buttons**: S (segment_zoom) and B (band_zoom) at bottom-left
+  of waterfall, matching SmartSDR protocol from pcap capture
+- **XVTR crash fix**: QPointer<PanadapterApplet> prevents SEGV when
+  panadapter destroyed during XVTR band switch
+- **CW decoder fix**: initial m_panApplet wasn't wired through
+  setActivePanApplet(), CW decode output went nowhere on first pan
+- **SpotHub**: unified spot management dialog (Settings → SpotHub) with 6 tabs:
+  DX Cluster (telnet), RBN (telnet), WSJT-X (UDP multicast decode), POTA
+  (HTTP polling api.pota.app), Spot List (sortable table with band filters),
+  Display (spot rendering settings). All spot sources run on a dedicated
+  worker thread with 1/sec batched forwarding. Features: spot density badges
+  with click-to-expand popup, per-source color coding, deduplication,
+  configurable lifetimes, SNR-based alpha for WSJT-X, WSJT-X decode filters
+  (CQ/CQ POTA/Calling Me), log file history per source.
+- **FreeDV Reporter spots**: real-time spot source via Socket.IO v4
+  WebSocket to qso.freedv.org. View-only auth, station state tracking,
+  spots from freq_change and rx_report events. QWebSocket with manual
+  Engine.IO/Socket.IO framing (no external dependencies). (#349)
+- **USB Cable management**: Radio Setup → USB Cables tab for configuring
+  USB-serial adapters plugged into the radio's rear USB ports. Supports
+  CAT, BCD, Bit (8-row grid), and Passthrough cable types. UsbCableModel
+  tracks cables via status messages, QStackedWidget property panels. (#40)
+- **FlexControl USB tuning knob**: auto-detect VID 0x2192 / PID 0x0010,
+  9600 8N1 serial protocol with D/U rotation (acceleration 02–06) and
+  3 configurable buttons (tap/double/hold). Radio Setup → Serial tab
+  config. Gated by HAVE_SERIALPORT. (#25)
+- **MIDI controller mapping**: class-compliant USB MIDI controller support
+  via RtMidi. 50+ mappable parameters (RX, TX, Phone/CW, EQ, Global).
+  MIDI Learn mode (select param, move knob, binding created). Dedicated
+  Settings → MIDI Mapping dialog with device selector, binding table,
+  activity indicator, and named profiles. Bindings stored in dedicated
+  ~/.config/AetherSDR/midi.settings XML file. Soft dependency (HAVE_MIDI).
+  (#355)
+- **Panadapter click-to-spot**: right-click context menu to add spots
+  with callsign, comment, lifetime, and optional DX cluster forwarding.
+  Right-click existing spots for tune, copy, QRZ lookup, remove. Spot
+  frequency snaps to tuning step size. (#36)
+- **Per-slice record/play**: Record (⏺) and Play (▶) buttons on VFO
+  flag. Radio-managed recording with pulsing indicator. Play disabled
+  until recording exists. TX playback via MOX for voice keyer. (#164)
+- **DAX IQ streaming**: raw I/Q data from radio DDC to SDR apps (SDR#,
+  GQRX, GNU Radio) via PulseAudio virtual capture devices. 4 channels
+  at 24/48/96/192 kHz. DaxIqModel + dedicated worker thread for byte-swap
+  and pipe I/O. DIGI applet controls + overlay pan routing. (#124)
+- **Opus codec independent of RADE**: HAVE_OPUS separated from HAVE_RADE
+  so SmartLink compressed audio works without RADE. System libopus
+  fallback via pkg-config. Windows setup-opus.ps1 script. (#375)
+- **Applet panel collapse**: ☰ hamburger in status bar toggles panel
+  visibility. Custom painted +PAN spectrum icon. Persisted. (#178)
+- **Drag-reorderable applets**: drag ⋮⋮ grip title bars to reorder
+  applets in the panel. QDrag framework with persistent order. View →
+  Reset Applet Order. (#335)
+- **Modeless dialogs**: SpotHub, Radio Setup, and MIDI Mapping dialogs
+  no longer block the main window. Duplicate prevention via QPointer.
+- **AppSettings atomic save**: write to .tmp, validate XML, rename.
+  Backup recovery from .bak. Count guard prevents truncated saves.
+  Key validation skips invalid XML element names.
+- **BNR crash fix**: r8brain resampler buffer overflow — maxBlockSamples
+  increased to 16384 for BNR's variable-size output. (#376)
+- **RadioModel shutdown fix**: disconnect signals before member
+  destruction to prevent use-after-free (found via ASAN).
+- **Spot label deconfliction**: proper stacking across all levels
+  before overflow to cluster badges.
+- **GPG release signing**: sign-release.yml workflow signs Linux
+  AppImage and source archives with detached .asc signatures.
+  SHA256SUMS.txt included. macOS uses Apple codesign. (#397, #398)
+- **Commit signing enforced**: branch protection requires GPG-signed
+  commits. CONTRIBUTING.md documents setup. Ed25519 keys.
+- **NR2/RN2/BNR DSP switch crash fix**: enabled flag now set AFTER
+  object construction to prevent SEGV when audio arrives during
+  mode switch (e.g. BNR→NR2).
+- **FlexControl coalescing**: rapid encoder steps batched into single
+  TCP command every 20ms, eliminating UI lag (#379)
+- **FlexControl menu wired**: Settings → FlexControl opens Radio
+  Setup Serial tab instead of "not implemented" (#380)
+- **TNF crash fix**: QPointer guards dangling SpectrumWidget pointer
+  in rebuildTnfMarkers lambda on pan removal. Duplicate tnf create
+  commands fixed via disconnect-before-connect (#381)
+- **ToggleMox/ToggleTune fix**: parse `mox=` from radio transmit
+  status so isMox() returns correct state for FlexControl toggle (#382)
+- **VFO lock icon sync**: connect lockedChanged in VfoWidget::setSlice
+  so lock icon updates from any source (#384)
+- **KDE/Cinnamon scroll fix**: accumulate angleDelta to normalize
+  high-resolution scroll deltas across desktop environments (#390, #405)
+- **ESC gain slider fix**: added vertical handle/groove QSS rules
+  to kSliderStyle so thumb renders grey not black (#394)
+- **Configurable band plan size**: View → Band Plan submenu with
+  Off/Small(6pt)/Medium(10pt)/Large(12pt)/Huge(16pt) (#406)
+- **Visual keyboard shortcut manager**: View → Configure Shortcuts dialog
+  with painted ANSI keyboard layout, color-coded by category, ~45
+  bindable actions, conflict detection, persistent bindings (#239)
+- **Click-and-drag VFO tuning**: drag inside filter passband to tune,
+  snapped to step size. Filter edge drag takes priority (#404)
+- **Go to Frequency shortcut**: G key opens VFO direct entry field
+- **Space PTT hold-to-transmit**: app-level event filter, works
+  regardless of widget focus, proper TX state sync
+- **RxApplet NR2 fix**: NR button 3-state cycle now actually enables
+  NR2 instead of only syncing the visual state (#329)
+- **Split pan fix**: TX slice created on same pan as RX slice in
+  multi-pan mode, CW split offsets 1 kHz up (#328)
 
 ## What's NOT Yet Implemented
 
 - RADE status indicator in VFO widget (sync/SNR display, #88)
 - RADE on Windows (#87)
-- Band stacking / band map
-- CW keyer / memories (keyboard input, CWX macros, practice mode — #18)
-- DAX IQ streaming for SDR apps (#124)
 - DAX on Windows (virtual audio devices, #87)
-- Spot / DX cluster integration
-- Macro / voice keyer
 - SmartLink NAT hole-punching (for radios without UPnP/port forwarding)
 - SmartLink WAN auto-reconnect
 - SmartLink jitter buffer for high-latency connections
-- Keyboard shortcuts and hotkeys
+- GPU-accelerated spectrum/waterfall via QRhi (#391)

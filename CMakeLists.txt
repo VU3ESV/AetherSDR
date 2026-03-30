@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(AetherSDR VERSION 0.5.7 LANGUAGES C CXX)
+project(AetherSDR VERSION 0.7.12 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,6 +24,12 @@ if(Qt6SerialPort_FOUND)
     message(STATUS "Qt6::SerialPort found — serial PTT/CW support enabled")
 else()
     message(STATUS "Qt6::SerialPort not found — serial PTT/CW support disabled")
+endif()
+find_package(Qt6 QUIET COMPONENTS WebSockets)
+if(Qt6WebSockets_FOUND)
+    message(STATUS "Qt6::WebSockets found — FreeDV Reporter spot source enabled")
+else()
+    message(STATUS "Qt6::WebSockets not found — FreeDV Reporter spot source disabled")
 endif()
 
 # PortAudio (optional fallback for audio)
@@ -113,6 +119,87 @@ else()
     endif()
 endif()
 
+# Opus codec — required for SmartLink compressed audio, independent of RADE.
+# When RADE is enabled, Opus comes from RADE's custom build (with FARGAN/OSCE).
+# When RADE is disabled, find system libopus.
+# Windows: run setup-opus.ps1 first to download prebuilt DLLs
+# Linux:   apt install libopus-dev
+# macOS:   brew install opus
+if(RADE_FOUND)
+    set(OPUS_FOUND TRUE)
+    message(STATUS "Opus: using RADE's bundled build")
+elseif(WIN32)
+    set(OPUS_ROOT "${CMAKE_SOURCE_DIR}/third_party/opus")
+    if(EXISTS "${OPUS_ROOT}/include/opus/opus.h")
+        set(OPUS_FOUND TRUE)
+        set(OPUS_INCLUDE_DIRS "${OPUS_ROOT}/include/opus")
+        set(OPUS_LIBRARIES "${OPUS_ROOT}/lib/opus.lib")
+        message(STATUS "Opus: using prebuilt Windows library (static)")
+    else()
+        set(OPUS_FOUND FALSE)
+        message(WARNING "Opus not found. Run setup-opus.ps1 to download it. "
+                        "SmartLink compressed audio will be unavailable.")
+    endif()
+else()
+    if(PkgConfig_FOUND)
+        pkg_check_modules(OPUS opus)
+    endif()
+    if(NOT OPUS_FOUND)
+        find_library(OPUS_LIB opus)
+        find_path(OPUS_INC opus/opus.h)
+        if(OPUS_LIB AND OPUS_INC)
+            set(OPUS_FOUND TRUE)
+            set(OPUS_LIBRARIES ${OPUS_LIB})
+            set(OPUS_INCLUDE_DIRS "${OPUS_INC}/opus")
+        endif()
+    endif()
+    if(OPUS_FOUND)
+        message(STATUS "Opus: using system libopus")
+    else()
+        message(WARNING "Opus not found — SmartLink compressed audio will be unavailable. "
+                        "Install libopus-dev (Debian/Ubuntu), opus (Arch/vcpkg), or brew install opus (macOS).")
+    endif()
+endif()
+
+# NVIDIA NIM BNR (Background Noise Removal) — GPU-accelerated neural denoising
+# Requires: grpc++, protobuf, NVIDIA RTX 4000+ GPU, Docker container
+option(ENABLE_BNR "Enable NVIDIA NIM BNR noise removal (requires grpc++)" OFF)
+if(ENABLE_BNR)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(GRPC REQUIRED grpc++)
+    pkg_check_modules(PROTOBUF REQUIRED protobuf)
+    find_program(PROTOC protoc REQUIRED)
+    find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin REQUIRED)
+
+    # Generate C++ stubs from bnr.proto
+    set(BNR_PROTO "${CMAKE_SOURCE_DIR}/src/core/proto/bnr.proto")
+    set(BNR_GEN_DIR "${CMAKE_BINARY_DIR}/bnr_gen")
+    file(MAKE_DIRECTORY ${BNR_GEN_DIR})
+
+    set(BNR_PB_CC "${BNR_GEN_DIR}/bnr.pb.cc")
+    set(BNR_PB_H  "${BNR_GEN_DIR}/bnr.pb.h")
+    set(BNR_GRPC_CC "${BNR_GEN_DIR}/bnr.grpc.pb.cc")
+    set(BNR_GRPC_H  "${BNR_GEN_DIR}/bnr.grpc.pb.h")
+
+    add_custom_command(
+        OUTPUT ${BNR_PB_CC} ${BNR_PB_H} ${BNR_GRPC_CC} ${BNR_GRPC_H}
+        COMMAND ${PROTOC}
+            --proto_path=${CMAKE_SOURCE_DIR}/src/core/proto
+            --cpp_out=${BNR_GEN_DIR}
+            --grpc_out=${BNR_GEN_DIR}
+            --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}
+            ${BNR_PROTO}
+        DEPENDS ${BNR_PROTO}
+        COMMENT "Generating BNR gRPC stubs from bnr.proto"
+    )
+
+    set(BNR_SOURCES ${BNR_PB_CC} ${BNR_GRPC_CC})
+    message(STATUS "NVIDIA BNR enabled (gRPC ${GRPC_VERSION})")
+else()
+    set(BNR_SOURCES "")
+    message(STATUS "NVIDIA BNR disabled (use -DENABLE_BNR=ON to enable)")
+endif()
+
 # Sources
 set(CORE_SOURCES
     src/core/AppSettings.cpp
@@ -126,16 +213,23 @@ set(CORE_SOURCES
     src/core/RigctlPty.cpp
     src/core/SmartLinkClient.cpp
     src/core/WanConnection.cpp
+    src/core/DxClusterClient.cpp
+    src/core/WsjtxClient.cpp
+    src/core/PotaClient.cpp
     src/core/RigctlServer.cpp
     src/core/FirmwareUploader.cpp
+    src/core/DvkWavTransfer.cpp
     src/core/FirmwareStager.cpp
     src/core/RNNoiseFilter.cpp
     src/core/CwDecoder.cpp
     src/core/Resampler.cpp
+    src/core/NvidiaBnrFilter.cpp
     src/core/RADEEngine.cpp
     src/core/LogManager.cpp
+    src/core/ShortcutManager.cpp
     src/core/SupportBundle.cpp
     src/core/SerialPortController.cpp
+    src/core/FlexControlManager.cpp
     src/core/OpusCodec.cpp
 )
 
@@ -156,6 +250,11 @@ set(MODEL_SOURCES
     src/models/TransmitModel.cpp
     src/models/EqualizerModel.cpp
     src/models/TnfModel.cpp
+    src/models/UsbCableModel.cpp
+    src/models/DaxIqModel.cpp
+    src/models/SpotModel.cpp
+    src/models/CwxModel.cpp
+    src/models/DvkModel.cpp
     src/models/BandSettings.cpp
     src/models/AntennaGeniusModel.cpp
 )
@@ -170,9 +269,14 @@ set(GUI_SOURCES
     src/gui/NetworkDiagnosticsDialog.cpp
     src/gui/MemoryDialog.cpp
     src/gui/SpotSettingsDialog.cpp
+    src/gui/DxClusterDialog.cpp
+    src/gui/CwxPanel.cpp
+    src/gui/DvkPanel.cpp
+    src/gui/AmpApplet.cpp
     src/gui/ProfileManagerDialog.cpp
     src/gui/PanadapterApplet.cpp
     src/gui/PanadapterStack.cpp
+    src/gui/PanLayoutDialog.cpp
     src/gui/AppletPanel.cpp
     src/gui/RxApplet.cpp
     src/gui/SMeterWidget.cpp
@@ -183,9 +287,12 @@ set(GUI_SOURCES
     src/gui/EqApplet.cpp
     src/gui/CatApplet.cpp
     src/gui/MeterSlider.cpp
+    src/gui/PhaseKnob.cpp
     src/gui/AntennaGeniusApplet.cpp
     src/gui/TitleBar.cpp
     src/gui/SupportDialog.cpp
+    src/gui/KeyboardMapWidget.cpp
+    src/gui/ShortcutDialog.cpp
 )
 
 set(ALL_SOURCES
@@ -271,7 +378,12 @@ endif()
 
 qt_add_resources(RESOURCES resources.qrc)
 
-add_executable(AetherSDR ${ALL_SOURCES} ${RNNOISE_SOURCES} ${GGMORSE_SOURCES} ${RADE_SOURCES} ${RESOURCES})
+add_executable(AetherSDR ${ALL_SOURCES} ${RNNOISE_SOURCES} ${GGMORSE_SOURCES} ${RADE_SOURCES} ${BNR_SOURCES} ${RESOURCES})
+
+# Windows: GUI app (no console window) + icon resource
+if(WIN32)
+    set_target_properties(AetherSDR PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
 
 # macOS app bundle
 if(APPLE)
@@ -290,6 +402,12 @@ if(APPLE)
         target_sources(AetherSDR PRIVATE "${MACOSX_ICON}")
         set_source_files_properties("${MACOSX_ICON}" PROPERTIES
             MACOSX_PACKAGE_LOCATION "Resources")
+    endif()
+elseif(WIN32)
+    # Windows application icon (taskbar, Start Menu, Alt-Tab)
+    set(WIN_RC "${CMAKE_SOURCE_DIR}/docs/AetherSDR.rc")
+    if(EXISTS "${WIN_RC}")
+        target_sources(AetherSDR PRIVATE "${WIN_RC}")
     endif()
 endif()
 
@@ -311,6 +429,32 @@ target_link_libraries(AetherSDR PRIVATE
 if(Qt6SerialPort_FOUND)
     target_compile_definitions(AetherSDR PRIVATE HAVE_SERIALPORT)
     target_link_libraries(AetherSDR PRIVATE Qt6::SerialPort)
+endif()
+
+if(Qt6WebSockets_FOUND)
+    target_compile_definitions(AetherSDR PRIVATE HAVE_WEBSOCKETS)
+    target_sources(AetherSDR PRIVATE src/core/FreeDvClient.cpp)
+    target_link_libraries(AetherSDR PRIVATE Qt6::WebSockets)
+endif()
+
+# Bundled RtMidi (MIT license) — MIDI controller support on all platforms
+message(STATUS "MIDI controller support enabled (bundled RtMidi)")
+target_compile_definitions(AetherSDR PRIVATE HAVE_MIDI)
+target_sources(AetherSDR PRIVATE
+    third_party/rtmidi/RtMidi.cpp
+    src/core/MidiControlManager.cpp
+    src/core/MidiSettings.cpp
+    src/gui/MidiMappingDialog.cpp)
+target_include_directories(AetherSDR PRIVATE third_party/rtmidi)
+if(APPLE)
+    target_compile_definitions(AetherSDR PRIVATE __MACOSX_CORE__)
+    target_link_libraries(AetherSDR PRIVATE "-framework CoreMIDI" "-framework CoreAudio" "-framework CoreFoundation")
+elseif(WIN32)
+    target_compile_definitions(AetherSDR PRIVATE __WINDOWS_MM__)
+    target_link_libraries(AetherSDR PRIVATE winmm)
+else()
+    target_compile_definitions(AetherSDR PRIVATE __LINUX_ALSA__)
+    target_link_libraries(AetherSDR PRIVATE asound)
 endif()
 
 if(PORTAUDIO_FOUND)
@@ -338,9 +482,22 @@ if(FFTW3_FOUND)
 endif()
 
 if(RADE_FOUND)
-    target_compile_definitions(AetherSDR PRIVATE HAVE_RADE)
+    target_compile_definitions(AetherSDR PRIVATE HAVE_RADE HAVE_OPUS)
     target_include_directories(AetherSDR PRIVATE ${RADE_DIR}/src)
     target_link_libraries(AetherSDR PRIVATE opus m)
+elseif(OPUS_FOUND)
+    target_compile_definitions(AetherSDR PRIVATE HAVE_OPUS)
+    target_include_directories(AetherSDR PRIVATE ${OPUS_INCLUDE_DIRS})
+    target_link_libraries(AetherSDR PRIVATE ${OPUS_LIBRARIES})
+endif()
+
+if(ENABLE_BNR)
+    target_compile_definitions(AetherSDR PRIVATE HAVE_BNR)
+    target_include_directories(AetherSDR PRIVATE
+        ${BNR_GEN_DIR}
+        ${GRPC_INCLUDE_DIRS}
+        ${PROTOBUF_INCLUDE_DIRS})
+    target_link_libraries(AetherSDR PRIVATE ${GRPC_LIBRARIES} ${PROTOBUF_LIBRARIES})
 endif()
 
 if(HAVE_PIPEWIRE)

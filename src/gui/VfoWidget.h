@@ -20,6 +20,7 @@ namespace AetherSDR {
 
 class SliceModel;
 class TransmitModel;
+class PhaseKnob;
 
 // Floating VFO info panel attached to the VFO marker on the spectrum display.
 // Shows slice info (antennas, frequency, signal level, filter width, TX/SPLIT)
@@ -50,8 +51,14 @@ public:
 
     QPushButton* nr2Button() const { return m_nr2Btn; }
     QPushButton* rn2Button() const { return m_rn2Btn; }
+    QPushButton* bnrButton() const { return m_bnrBtn; }
     void setAfGain(int pct);
+    void setEscLevel(float dbm);
     void syncFromSlice();
+    void setRecordOn(bool on);
+    void setPlayOn(bool on);
+    void setPlayEnabled(bool enabled);
+    void beginDirectEntry();
     QLabel* freqLabel() const { return m_freqLabel; }
 
 #ifdef HAVE_RADE
@@ -67,9 +74,12 @@ Q_SIGNALS:
     void lockToggled(bool locked);
     void nr2Toggled(bool on);
     void rn2Toggled(bool on);
+    void bnrToggled(bool on);
 #ifdef HAVE_RADE
     void radeActivated(bool on, int sliceId);
 #endif
+    void recordToggled(bool on);
+    void playToggled(bool on);
     void splitToggled();
     void swapRequested();
     void autotuneRequested(bool intermittent);  // CW auto-tune: false=once, true=loop
@@ -109,6 +119,9 @@ private:
     QLabel*      m_sliceBadge{nullptr};
     QPointer<QPushButton> m_lockVfoBtn;
     QPointer<QPushButton> m_closeSliceBtn;
+    QPointer<QPushButton> m_recordBtn;
+    QPointer<QPushButton> m_playBtn;
+    QTimer* m_recordPulse{nullptr};
 
     // Frequency / meter
     QLabel* m_freqLabel{nullptr};
@@ -128,6 +141,18 @@ private:
     QSlider* m_panSlider{nullptr};
     QPushButton* m_muteBtn{nullptr};
     QPushButton* m_divBtn{nullptr};
+    // ESC (Enhanced Signal Clarity) panel — shown when DIV is active (parent only)
+    QWidget*     m_escPanel{nullptr};
+    QPushButton* m_escBtn{nullptr};
+    PhaseKnob*   m_phaseKnob{nullptr};
+    QSlider*     m_escPhaseSlider{nullptr};
+    QSlider*     m_escGainSlider{nullptr};
+    QLabel*      m_escPhaseLbl{nullptr};
+    QLabel*      m_escGainLbl{nullptr};
+    QLabel*      m_escMeterLbl{nullptr};
+    QLabel*      m_escDbmLbl{nullptr};
+    QWidget*     m_escMeterBar{nullptr};
+    float        m_escLevelDbm{-130.0f};
     QPushButton* m_sqlBtn{nullptr};
     bool         m_savedSquelchOn{false};
 public:
@@ -145,6 +170,7 @@ private:
     QPushButton* m_nrsBtn{nullptr};
     QPushButton* m_rnnBtn{nullptr};
     QPushButton* m_rn2Btn{nullptr};
+    QPushButton* m_bnrBtn{nullptr};
     QPushButton* m_nrfBtn{nullptr};
     QPushButton* m_anflBtn{nullptr};
     QPushButton* m_anftBtn{nullptr};

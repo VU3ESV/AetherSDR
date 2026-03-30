@@ -36,6 +36,10 @@ public:
                              bool autoBlack, int rate,
                              int floorPos = 75, bool floorEnable = false);
 
+    // Set the panadapter ID this overlay belongs to (for +RX routing).
+    void setPanId(const QString& id) { m_panId = id; }
+    QString panId() const { return m_panId; }
+
     // Connect/disconnect the ANT panel to a slice model.
     void setSlice(SliceModel* slice);
     void setWnbState(bool on, int level);
@@ -46,6 +50,7 @@ public:
     void setXvtrBands(const QVector<XvtrBand>& bands);
     QPushButton* dspNr2Button() const;
     QPushButton* dspRn2Button() const;
+    QPushButton* dspBnrButton() const;
 
 protected:
     bool eventFilter(QObject* obj, QEvent* event) override;
@@ -54,12 +59,15 @@ protected:
     void mouseReleaseEvent(QMouseEvent* event) override { event->accept(); }
 
 signals:
-    void addRxClicked();
+    void addRxClicked(const QString& panId);
     void addTnfClicked();
+    void daxIqChannelChanged(int channel);  // 0=Off, 1-4
     void addPanClicked();
     void daxClicked();
     void nr2Toggled(bool on);
     void rn2Toggled(bool on);
+    void bnrToggled(bool on);
+    void bnrIntensityChanged(float ratio);
     // Display sub-panel signals
     void fftAverageChanged(int frames);
     void fftFpsChanged(int fps);
@@ -82,6 +90,7 @@ signals:
     void rfGainChanged(int gain);
 
 private:
+    QString m_panId;
     void toggle();
     void updateLayout();
     void toggleBandPanel();
@@ -133,6 +142,7 @@ private:
     QWidget*   m_daxPanel{nullptr};
     bool       m_daxPanelVisible{false};
     QComboBox* m_daxCmb{nullptr};
+    QComboBox* m_daxIqCmb{nullptr};
 
     // Display sub-panel
     QWidget*     m_displayPanel{nullptr};

@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="docs/logo-circle.png" alt="AetherSDR Logo" width="200">
-</p>
-
 # AetherSDR
 
 **A Linux-native client for FlexRadio Systems transceivers**
@@ -13,13 +9,13 @@
 
 AetherSDR brings FlexRadio operation to Linux without Wine or virtual machines. Built from the ground up with Qt6 and C++20, it speaks the SmartSDR protocol natively and aims to replicate the full SmartSDR experience.
 
-**Current version: 0.5.7** | [Download](https://github.com/ten9876/AetherSDR/releases/latest) | [Discussions](https://github.com/ten9876/AetherSDR/discussions)
+**Current version: 0.7.12** | [Download](https://github.com/ten9876/AetherSDR/releases/latest) | [Discussions](https://github.com/ten9876/AetherSDR/discussions)
 
 > **Cross-platform downloads available:** Linux AppImage, macOS universal DMG, Windows installer (.exe) and portable ZIP.
 > Linux is the primary supported platform. macOS and Windows builds are provided as a courtesy
 > but are unsupported and low priority until post-v1.0.
 
-![AetherSDR Screenshot](docs/screenshot-v4.png)
+![AetherSDR Screenshot](docs/screenshot-v5.png)
 
 <p><i>Native. Open. Yours.</i></p>
 
@@ -42,6 +38,8 @@ Tested with the **FLEX-8600** running v4.1.5 software. Should work with other Fl
 - +RX button creates new slices on the current panadapter
 - Right-click context menu to close slices
 - Off-screen slice indicators with frequency display
+- **Diversity mode (DIV)** — dual-SCU diversity reception with ESC beamforming
+- **ESC controls** — polar display, phase/gain sliders, real-time ESC signal meter
 
 ### Panadapter & Waterfall
 - Real-time FFT spectrum and scrolling waterfall display
@@ -50,6 +48,8 @@ Tested with the **FLEX-8600** running v4.1.5 software. Should work with other Fl
 - dBm scale with drag-to-adjust, time scale on waterfall
 - ARRL band plan overlay on FFT display (color-coded CW/DATA/PHONE segments with license classes)
 - Spot frequency markers with hover tooltips (QRP calling, beacons, SSTV, etc.)
+- **SpotHub** — unified spot manager (Settings → SpotHub) with DX Cluster, RBN, WSJT-X, POTA, and FreeDV sources, sortable spot list with band filters, density badges, per-source color coding, and configurable lifetimes
+- **FreeDV Reporter** — real-time FreeDV station spots via Socket.IO WebSocket to qso.freedv.org
 - Floating VFO widget with S-meter, frequency, and quick controls
 - Band selector with ARRL band plan defaults
 - Display sub-menu: AVG, FPS, FFT fill (opacity + color), weighted average
@@ -57,12 +57,14 @@ Tested with the **FLEX-8600** running v4.1.5 software. Should work with other Fl
 - Native VITA-49 waterfall tiles with automatic FFT fallback during TX
 - FFT and waterfall rendering fully decoupled
 - All overlays consume mouse/wheel events (no accidental VFO tuning)
+- Band zoom buttons (S/B) — quick zoom to phone segment or full band
 
 ### Receiver Controls
 - Full RX controls: antenna, filter presets, AGC, AF gain, pan, squelch
 - All DSP modes: NB, NR, NR2 (spectral), ANF, NRL, NRS, RNN, RN2 (RNNoise), NRF, ANFL, ANFT, APF
 - **NR2 spectral noise reduction** — Ephraim-Malah MMSE-LSA with OSMS floor tracking (contributed by @EI6JGB)
 - **RN2 neural noise suppression** — Mozilla/Xiph RNNoise deep-learning denoiser, bundled (no external dependency)
+- **BNR GPU noise removal** — NVIDIA Maxine neural denoiser via self-hosted Docker container (RTX 4000+), real-time gRPC streaming with intensity control
 - FFTW3 optimized FFTs with automatic radix-2 fallback and background wisdom generation
 - DSP level sliders (0-100) for all supported features
 - **CW decoder** — real-time Morse decode using ggmorse, auto-detects pitch and speed, confidence-colored text (green/yellow/orange/red)
@@ -147,13 +149,36 @@ Tested with the **FLEX-8600** running v4.1.5 software. Should work with other Fl
 - PC audio input/output device selection with live switching
 - Full settings in Radio Setup → Audio tab
 
+### USB Cable Management
+- Configure USB-serial adapters plugged into the radio's rear USB ports
+- CAT cable: serial parameters, frequency source, auto-report
+- BCD cable: band decoder with polarity and HF/VHF selection
+- Bit cable: 8 independent bits with band/frequency/PTT/delay per bit
+- Passthrough cable: raw serial tunnel with configurable serial parameters
+
+### MIDI Controller Mapping
+- Map any class-compliant USB MIDI controller to 50+ AetherSDR parameters
+- **MIDI Learn** — select a parameter, move a knob, binding created automatically
+- Supports CC (knobs/faders), Note On/Off (buttons/pads), and Pitch Bend
+- Dedicated Settings → MIDI Mapping dialog with device selector and binding table
+- Real-time activity indicator showing incoming MIDI messages
+- Named profiles for different controllers (save/load)
+- Parameters: AF gain, squelch, RF power, MOX, TUNE, mic level, EQ bands, and more
+- Bindings persisted in dedicated `midi.settings` XML file
+- Optional dependency (RtMidi) — feature hidden when not available
+
 ### Radio Setup
-- Full settings dialog (9 tabs): Radio, Network, GPS, Audio, TX, Phone/CW, RX, Filters, XVTR
+- Full settings dialog (10 tabs): Radio, Network, GPS, Audio, TX, Phone/CW, RX, Filters, XVTR, USB Cables
 - Per-band TX settings: RF power, tune power, PTT inhibit, interlock routing
 - TX profile management
 - XVTR transverter configuration
 - **Firmware update** — upload .ssdr files directly from Linux (no Windows required)
 - Network diagnostics, memory channels, spot settings
+
+### External Control
+- **FlexControl USB tuning knob** — auto-detect, rotary tuning with acceleration, 3 configurable buttons
+- **MIDI controllers** — knobs, faders, and buttons mapped to radio parameters with Learn mode
+- **Serial PTT/CW keying** — USB-serial DTR/RTS output for PTT and CW key, CTS/DSR input for foot switch/paddle
 
 ### General
 - Click-to-tune and scroll-wheel tuning on spectrum
@@ -199,7 +224,8 @@ sudo pacman -S qt6-base qt6-multimedia cmake ninja pkgconf autoconf automake lib
 
 # Ubuntu 24.04+ / Debian / Linux Mint
 sudo apt install qt6-base-dev qt6-multimedia-dev cmake ninja-build pkg-config \
-  autoconf automake libtool gstreamer1.0-pulseaudio gstreamer1.0-plugins-base
+  autoconf automake libtool gstreamer1.0-pulseaudio gstreamer1.0-plugins-base \
+  libxkbcommon-dev
 
 # Fedora
 sudo dnf install qt6-qtbase-devel qt6-qtmultimedia-devel cmake ninja-build \
@@ -258,16 +284,17 @@ This places `AetherSDR` in `/usr/local/bin`, the `.desktop` file in the app laun
 - [x] 3-tier TX power meters (barefoot/Aurora/PGXL)
 - [x] Memory channel editor (all columns editable)
 - [x] SmartSDR-style status bar with clickable TNF toggle
+- [x] Diversity mode (DIV) with ESC beamforming — phase/gain sliders, polar display, ESC meter (#20, #38)
+- [x] NVIDIA NIM BNR GPU noise removal — world's first GPU-accelerated AI noise removal in an SDR client (#288)
 
 ### In Progress
-- [ ] Diversity mode (DIV) — toggle implemented, ESC phase/gain controls planned (#20, #38)
 - [ ] DAX IQ streaming for SDR apps (#124)
 - [ ] SmartLink own Auth0 credentials (pending FlexRadio developer support)
 
 ### Planned
 - [ ] DAX audio channels — Windows virtual audio devices (#87)
 - [ ] Band stacking registers
-- [ ] Spot / DX cluster integration
+- [x] SpotHub — DX Cluster, RBN, WSJT-X, POTA spot integration with density badges
 - [ ] CW keyer memories and CWX macros (#18)
 - [ ] Keyboard shortcuts and hotkeys
 - [ ] Master PC volume control (#137)
@@ -285,6 +312,25 @@ PRs, bug reports, and feature requests welcome! See [CONTRIBUTING.md](CONTRIBUTI
 **Not a developer?** You can still contribute great feature requests using AI. See the [AI-Assisted Feature Requests](CONTRIBUTING.md#ai-assisted-feature-requests) section in our contributing guide — it walks you through using Claude.ai to turn your idea into a well-structured request that's easy for us to implement.
 
 The codebase is modular — each subsystem (core protocol, models, GUI widgets) can be worked on independently. Check [Issues](https://github.com/ten9876/AetherSDR/issues) for current tasks.
+
+---
+
+## Verifying Downloads
+
+Linux AppImages, Windows binaries, and source archives are GPG-signed. macOS
+artifacts are Apple notarized. Each release includes detached signatures
+(`.asc`) and a signed `SHA256SUMS.txt`. All commits on `main` are signed
+by their authors.
+
+```bash
+# Import the public key
+curl -sSL https://raw.githubusercontent.com/ten9876/AetherSDR/main/docs/RELEASE-SIGNING-KEY.pub.asc | gpg --import
+
+# Verify a download
+gpg --verify AetherSDR-v1.0.0-x86_64.AppImage.asc AetherSDR-v1.0.0-x86_64.AppImage
+```
+
+See [docs/VERIFYING-RELEASES.md](docs/VERIFYING-RELEASES.md) for full instructions.
 
 ---
 

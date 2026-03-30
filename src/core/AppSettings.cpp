@@ -9,6 +9,7 @@
 #include <QUuid>
 #include <QDebug>
 #include <QCoreApplication>
+#include <QRegularExpression>
 
 namespace AetherSDR {
 
@@ -79,10 +80,53 @@ void AppSettings::load()
         }
     }
 
-    if (xml.hasError())
+    if (xml.hasError()) {
         qWarning() << "AppSettings: XML parse error:" << xml.errorString();
 
+        // Try to recover from backup if the main file is corrupt
+        const QString bakPath = m_filePath + ".bak";
+        if (QFile::exists(bakPath) && m_settings.size() < 10) {
+            qWarning() << "AppSettings: main file corrupt, recovering from backup";
+            file.close();
+            m_settings.clear();
+            m_stationSettings.clear();
+
+            QFile bakFile(bakPath);
+            if (bakFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                QXmlStreamReader bakXml(&bakFile);
+                QString bakStation;
+                while (!bakXml.atEnd()) {
+                    bakXml.readNext();
+                    if (bakXml.isStartElement()) {
+                        const QString tag = bakXml.name().toString();
+                        if (tag == "Settings") continue;
+                        if (tag == m_stationName && bakStation.isEmpty()) {
+                            bakStation = tag;
+                            continue;
+                        }
+                        const QString text = bakXml.readElementText();
+                        if (!bakStation.isEmpty())
+                            m_stationSettings.insert(tag, text);
+                        else {
+                            m_settings.insert(tag, text);
+                            if (tag == "StationName") m_stationName = text;
+                        }
+                    } else if (bakXml.isEndElement()) {
+                        if (bakXml.name().toString() == m_stationName && !bakStation.isEmpty())
+                            bakStation.clear();
+                    }
+                }
+                bakFile.close();
+                if (!bakXml.hasError())
+                    qDebug() << "AppSettings: recovered" << m_settings.size() << "settings from backup";
+                else
+                    qWarning() << "AppSettings: backup also corrupt:" << bakXml.errorString();
+            }
+        }
+    }
+
     file.close();
+    m_loadedCount = m_settings.size();
     qDebug() << "AppSettings: loaded" << m_settings.size() << "settings +"
              << m_stationSettings.size() << "station settings from" << m_filePath;
 }
@@ -91,9 +135,22 @@ void AppSettings::load()
 
 void AppSettings::save()
 {
-    QFile file(m_filePath);
+    // Guard: refuse to save if we'd lose more than half the settings.
+    // This catches cases where the app crashes early or settings were
+    // cleared from memory before save() runs.
+    if (m_loadedCount > 20 && m_settings.size() < m_loadedCount / 2) {
+        qWarning() << "AppSettings: refusing to save — only" << m_settings.size()
+                   << "settings, loaded" << m_loadedCount << "(would lose data)";
+        return;
+    }
+
+    // Atomic save: write to temp file, then rename over the original.
+    // This prevents data loss if the app crashes or is killed mid-write.
+    const QString tmpPath = m_filePath + ".tmp";
+
+    QFile file(tmpPath);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        qWarning() << "AppSettings: cannot write" << m_filePath;
+        qWarning() << "AppSettings: cannot write" << tmpPath;
         return;
     }
 
@@ -106,8 +163,13 @@ void AppSettings::save()
     // Write top-level settings (sorted for consistency)
     QList<QString> keys = m_settings.keys();
     std::sort(keys.begin(), keys.end());
+    static const QRegularExpression validKey("^[A-Za-z_][A-Za-z0-9_./]*$");
     for (const auto& key : keys) {
-        // Skip station name element here — it goes inline
+        // Skip keys that aren't valid XML element names
+        if (!validKey.match(key).hasMatch()) {
+            qWarning() << "AppSettings: skipping invalid key:" << key;
+            continue;
+        }
         xml.writeTextElement(key, m_settings.value(key));
     }
 
@@ -125,6 +187,35 @@ void AppSettings::save()
     xml.writeEndElement(); // Settings
     xml.writeEndDocument();
     file.close();
+
+    // Validate the temp file before committing — re-read and parse it.
+    // If parsing fails, the file is corrupt; don't overwrite the original.
+    {
+        QFile check(tmpPath);
+        if (check.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            QXmlStreamReader validator(&check);
+            while (!validator.atEnd()) validator.readNext();
+            check.close();
+            if (validator.hasError()) {
+                qWarning() << "AppSettings: temp file failed validation:"
+                           << validator.errorString() << "— NOT saving";
+                QFile::remove(tmpPath);
+                return;
+            }
+        }
+    }
+
+    // Atomic rename: on Linux/macOS this is a single inode swap.
+    // On Windows, QFile::rename fails if the target exists, so remove first.
+    if (QFile::exists(m_filePath)) {
+        // Keep a backup in case something goes wrong
+        const QString bakPath = m_filePath + ".bak";
+        QFile::remove(bakPath);
+        QFile::rename(m_filePath, bakPath);
+    }
+    if (!QFile::rename(tmpPath, m_filePath)) {
+        qWarning() << "AppSettings: atomic rename failed from" << tmpPath << "to" << m_filePath;
+    }
 }
 
 // ─── Top-level accessors ──────────────────────────────────────────────────────

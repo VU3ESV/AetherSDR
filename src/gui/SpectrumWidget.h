@@ -1,10 +1,12 @@
 #pragma once
 
 #include <QWidget>
+#include <QPushButton>
 #include <QVector>
 #include <QMap>
 #include <QImage>
 #include <QColor>
+#include <QDateTime>
 
 namespace AetherSDR {
 
@@ -74,7 +76,8 @@ public:
     // Set the FFT/waterfall split ratio programmatically.
     void setSpectrumFrac(float f);
 
-    // Set the click/scroll tuning step size in Hz (default 100).
+    // Get/set the click/scroll tuning step size in Hz (default 100).
+    int stepSize() const { return m_stepHz; }
     void setStepSize(int hz) { m_stepHz = hz; }
 
     // Set the per-mode filter limits (Hz). Called when mode changes.
@@ -99,8 +102,11 @@ public:
     int  rfGainValue() const { return m_rfGainValue; }
     void setWnbActive(bool on) { m_wnbActive = on; update(); }
     void setRfGain(int gain) { m_rfGainValue = gain; update(); }
-    void setShowBandPlan(bool on) { m_showBandPlan = on; update(); }
-    bool showBandPlan() const { return m_showBandPlan; }
+    void setShowBandPlan(bool on) { m_bandPlanFontSize = on ? 6 : 0; update(); }
+    void setBandPlanFontSize(int pt) { m_bandPlanFontSize = pt; update(); }
+    void setSingleClickTune(bool on) { m_singleClickTune = on; }
+    bool showBandPlan() const { return m_bandPlanFontSize > 0; }
+    int  bandPlanFontSize() const { return m_bandPlanFontSize; }
 
     // ── Display control setters ───────────────────────────────────────────
     // FFT controls (save to AppSettings on each change)
@@ -153,6 +159,8 @@ public:
                          int rttyMark = 2125, int rttyShift = 170,
                          bool ritOn = false, int ritFreq = 0,
                          bool xitOn = false, int xitFreq = 0);
+    // Update just the frequency on an existing overlay (for optimistic scroll-to-tune)
+    void setSliceOverlayFreq(int sliceId, double freqMhz);
     // Remove a slice overlay.
     void removeSliceOverlay(int sliceId);
 
@@ -169,6 +177,34 @@ public:
     };
     void setTnfMarkers(const QVector<TnfMarker>& markers);
     void setTnfGlobalEnabled(bool on);
+
+    struct SpotMarker {
+        int    index;
+        QString callsign;
+        double freqMhz;
+        QString color;       // #AARRGGBB or empty for default
+        QString mode;
+        QString source;
+        QString spotterCallsign;
+        QString comment;
+        QDateTime timestamp;
+    };
+    void setSpotMarkers(const QVector<SpotMarker>& markers);
+
+    struct SpotCluster {
+        QRect rect;
+        QVector<SpotMarker> spots;
+    };
+
+    void setShowSpots(bool on) { m_showSpots = on; update(); }
+    bool showSpots() const { return m_showSpots; }
+    void setSpotFontSize(int px) { m_spotFontSize = px; update(); }
+    void setSpotMaxLevels(int n) { m_spotMaxLevels = n; update(); }
+    void setSpotStartPct(int pct) { m_spotStartPct = pct; update(); }
+    void setSpotOverrideColors(bool on) { m_spotOverrideColors = on; update(); }
+    void setSpotColor(const QColor& c) { m_spotColor = c; update(); }
+    void setSpotBgColor(const QColor& c) { m_spotBgColor = c; update(); }
+    void setSpotBgOpacity(int pct) { m_spotBgOpacity = pct; update(); }
     void setTransmitting(bool tx) {
         if (tx && !m_transmitting)
             m_preTxAutoBlack = m_autoBlackThresh;  // save before TX
@@ -184,15 +220,18 @@ signals:
     void sliceClicked(int sliceId);
     // Emitted when the user clicks or scrolls in the panadapter area.
     void frequencyClicked(double mhz);
+    void spotTriggered(int spotIndex);
     // Emitted when the user drags the frequency scale bar to change bandwidth.
     void bandwidthChangeRequested(double newBandwidthMhz);
+    // Band/segment zoom: radio handles center/bandwidth (SmartSDR pcap: "band_zoom=1" / "segment_zoom=1")
+    void bandZoomRequested();
+    void segmentZoomRequested();
     // Emitted when the user drags the waterfall to pan the center frequency.
     void centerChangeRequested(double newCenterMhz);
     // Emitted when the user drags a filter edge to resize the passband.
     void filterChangeRequested(int lowHz, int highHz);
     // Emitted when the user adjusts the dBm scale (drag or arrows).
     void dbmRangeChangeRequested(float minDbm, float maxDbm);
-
     // TNF signals
     void tnfCreateRequested(double freqMhz);
     void tnfMoveRequested(int id, double newFreqMhz);
@@ -202,6 +241,11 @@ signals:
     void tnfPermanentRequested(int id, bool permanent);
     void sliceCloseRequested(int sliceId);
     void sliceTxRequested(int sliceId);
+    // Spot signals
+    void spotAddRequested(double freqMhz, const QString& callsign,
+                          const QString& comment, int lifetimeSec,
+                          bool forwardToCluster);
+    void spotRemoveRequested(int spotIndex);
 
 protected:
     void paintEvent(QPaintEvent* event) override;
@@ -213,14 +257,18 @@ protected:
     void wheelEvent(QWheelEvent* event) override;
 
 private:
+    void showAddSpotDialog(double freqMhz);
     void drawGrid(QPainter& p, const QRect& r);
     void drawSpectrum(QPainter& p, const QRect& r);
     void drawSliceMarkers(QPainter& p, const QRect& specRect, const QRect& wfRect);
     void drawOffScreenSlices(QPainter& p, const QRect& specRect);
     void drawBandPlan(QPainter& p, const QRect& specRect);
     void drawTnfMarkers(QPainter& p, const QRect& specRect, const QRect& wfRect);
+    void drawSpotMarkers(QPainter& p, const QRect& specRect);
+    void showSpotClusterPopup(const SpotCluster& cluster, const QPoint& globalPos);
     int  tnfAtPixel(int x) const;
     void drawWaterfall(QPainter& p, const QRect& r);
+    void positionZoomButtons();
     void drawFreqScale(QPainter& p, const QRect& r);
     void drawDbmScale(QPainter& p, const QRect& specRect);
     void drawTimeScale(QPainter& p, const QRect& wfRect);
@@ -263,6 +311,8 @@ private:
 
     // Tuning step size for click-snap and wheel scroll (Hz)
     int m_stepHz{100};
+    int m_scrollAccum{0};   // trackpad pixel scroll accumulator (macOS)
+    int m_angleAccum{0};    // mouse wheel angle accumulator (#390)
 
     // ── FFT display controls (radio-side via "display pan set") ──────────
     int   m_panIndex{0};             // per-pan settings index (0, 1, 2, 3)
@@ -313,6 +363,8 @@ private:
     // Filter edge drag state
     enum class FilterEdge { None, Low, High };
     FilterEdge m_draggingFilter{FilterEdge::None};
+    // VFO passband drag state (#404)
+    bool m_draggingVfo{false};
     // dBm scale strip drag state
     static constexpr int DBM_STRIP_W = 36;  // width of the dBm scale strip
     static constexpr int DBM_ARROW_H = 14;  // height of each arrow button
@@ -326,7 +378,9 @@ private:
     // On-screen indicators (WNB, RF Gain)
     bool m_wnbActive{false};
     int  m_rfGainValue{0};
-    bool m_showBandPlan{true};
+    int  m_bandPlanFontSize{6};  // 0 = off
+    bool m_singleClickTune{false};
+    QPoint m_clickPressPos;        // for single-click-to-tune drag threshold
     bool m_showTxInWaterfall{false};  // default matches radio default (off)
     bool m_hasTxSlice{false};  // true if this pan contains the TX slice
 
@@ -351,6 +405,23 @@ private:
     // ── TNF markers ────────────────────────────────────────────────────
     QVector<TnfMarker> m_tnfMarkers;
     bool m_tnfGlobalEnabled{true};
+    QVector<SpotMarker> m_spotMarkers;
+    struct SpotHitRect {
+        QRect rect;
+        double freqMhz;
+        int markerIndex;  // index into m_spotMarkers for tooltip data
+    };
+    QVector<SpotHitRect> m_spotClickRects;
+
+    QVector<SpotCluster> m_spotClusters;
+    bool m_showSpots{true};
+    int  m_spotFontSize{16};
+    int  m_spotMaxLevels{3};
+    int  m_spotStartPct{50};      // % down from top of spectrum
+    bool   m_spotOverrideColors{false};
+    QColor m_spotColor{Qt::yellow};
+    QColor m_spotBgColor{Qt::black};
+    int    m_spotBgOpacity{48};
     int  m_draggingTnfId{-1};
     double m_dragTnfOrigFreq{0.0};
 
@@ -359,6 +430,10 @@ private:
     // VFO info widgets (one per slice, attached to VFO markers)
     QMap<int, VfoWidget*> m_vfoWidgets;
     VfoWidget* m_vfoWidget{nullptr};  // alias to active slice widget (compat)
+
+    // Bottom-left waterfall zoom buttons: S(egment), B(and)
+    QPushButton* m_zoomSegBtn{nullptr};
+    QPushButton* m_zoomBandBtn{nullptr};
 };
 
 } // namespace AetherSDR

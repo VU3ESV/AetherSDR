@@ -10,12 +10,25 @@
 #include "core/SmartLinkClient.h"
 #include "core/WanConnection.h"
 #include "core/CwDecoder.h"
+#include "core/DxClusterClient.h"
+#include "core/WsjtxClient.h"
+#include "core/PotaClient.h"
+#ifdef HAVE_WEBSOCKETS
+#include "core/FreeDvClient.h"
+#endif
+#include <QThread>
 #ifdef HAVE_SERIALPORT
 #include "core/SerialPortController.h"
+#include "core/FlexControlManager.h"
 #endif
+#ifdef HAVE_MIDI
+#include "core/MidiControlManager.h"
+#endif
+#include "core/ShortcutManager.h"
 
 #include <QMainWindow>
 #include <QSplitter>
+#include <QPointer>
 #include <QLabel>
 #include <QMenu>
 #include <QStatusBar>
@@ -28,6 +41,8 @@ class SpectrumWidget;
 class PanadapterApplet;
 class PanadapterStack;
 class AppletPanel;
+class CwxPanel;
+class DvkPanel;
 #ifdef HAVE_RADE
 class RADEEngine;
 #endif
@@ -49,6 +64,8 @@ public:
 
 protected:
     void closeEvent(QCloseEvent* event) override;
+    void keyPressEvent(QKeyEvent* event) override;
+    void keyReleaseEvent(QKeyEvent* event) override;
     bool eventFilter(QObject* obj, QEvent* event) override;
 
 private slots:
@@ -73,9 +90,15 @@ private:
     void updateSplitState();
     void disableSplit();
     void wirePanadapter(PanadapterApplet* applet);
+    void setActivePanApplet(PanadapterApplet* applet);
     SpectrumWidget* spectrumForSlice(SliceModel* s) const;
     void wireVfoWidget(VfoWidget* w, SliceModel* s);
-    void wireActiveVfoSignals(VfoWidget* w);
+    void enableNr2WithWisdom();  // Wisdom-gated NR2 enable (shared by VFO + overlay)
+    void registerShortcutActions();
+    void updateKeyerAvailability(const QString& mode);
+    void applyPanLayout(const QString& layoutId);
+    void createPansSequentially(const QString& layoutId, int total,
+                                std::shared_ptr<QStringList> panIds, int created);
 
     BandSnapshot captureCurrentBandState() const;
     void restoreBandState(const BandSnapshot& snap);
@@ -93,8 +116,33 @@ private:
     WanConnection     m_wanConnection;
     AntennaGeniusModel m_antennaGenius;
     CwDecoder         m_cwDecoder;
+    DxClusterClient*   m_dxCluster{nullptr};
+    DxClusterClient*   m_rbnClient{nullptr};
+    WsjtxClient*       m_wsjtxClient{nullptr};
+    PotaClient*        m_potaClient{nullptr};
+#ifdef HAVE_WEBSOCKETS
+    FreeDvClient*      m_freedvClient{nullptr};
+#endif
+    QThread*           m_spotThread{nullptr};
+
+    // Spot deduplication: callsign → {freqMhz, timestamp ms}
+    struct SpotDedup {
+        double freqMhz;
+        qint64 addedMs;
+    };
+    QHash<QString, SpotDedup> m_spotDedup;
+
+    // Batched spot add commands (flushed 1/sec)
+    QStringList m_spotCmdBatch;
 #ifdef HAVE_SERIALPORT
     SerialPortController m_serialPort;
+    FlexControlManager   m_flexControl;
+    QTimer               m_flexCoalesceTimer;
+    int                  m_flexPendingSteps{0};
+#endif
+#ifdef HAVE_MIDI
+    MidiControlManager   m_midiControl;
+    void registerMidiParams();
 #endif
 
     // GUI — left sidebar
@@ -104,10 +152,17 @@ private:
     TitleBar*         m_titleBar{nullptr};
     QSplitter*        m_splitter{nullptr};
     PanadapterStack*  m_panStack{nullptr};
-    PanadapterApplet* m_panApplet{nullptr};  // backward compat alias to active applet
+    QPointer<PanadapterApplet> m_panApplet;  // backward compat alias to active applet
 
     // GUI — right applet panel
     AppletPanel*     m_appletPanel{nullptr};
+
+    // Modeless dialogs
+    QPointer<QDialog> m_spotHubDialog;
+    QPointer<QDialog> m_radioSetupDialog;
+#ifdef HAVE_MIDI
+    QPointer<QDialog> m_midiDialog;
+#endif
 
     // Menus
     QMenu*           m_profilesMenu{nullptr};
@@ -121,8 +176,12 @@ private:
     // Status bar labels (SmartSDR-style)
     QLabel* m_connStatusLabel{nullptr};   // hidden, used for connection state logic
     QLabel* m_addPanLabel{nullptr};
+    QLabel* m_panelToggle{nullptr};
+    QAction* m_panelVisAction{nullptr};
     QLabel* m_tnfIndicator{nullptr};
     QLabel* m_cwxIndicator{nullptr};
+    CwxPanel* m_cwxPanel{nullptr};
+    DvkPanel* m_dvkPanel{nullptr};
     QLabel* m_dvkIndicator{nullptr};
     QLabel* m_fdxIndicator{nullptr};
     QLabel* m_radioInfoLabel{nullptr};
@@ -152,7 +211,14 @@ private:
     void toggleConnectionDialog();
     bool m_useSystemClock{true};     // true when no GPS installed
     bool m_userDisconnected{false};  // true after explicit disconnect, blocks auto-connect
+    QDialog* m_reconnectDlg{nullptr}; // shown on unexpected disconnect, dismissed on reconnect
     bool m_displaySettingsPushed{false};  // one-shot: push saved display settings after pan created
+    bool m_applyingLayout{false};        // true during layout tear-down/recreate — suppresses panadapterAdded handler
+    QTimer* m_layoutRestoreTimer{nullptr}; // debounced layout rearrange after pans added on connect
+    QTimer* m_heartbeatMissTimer{nullptr}; // fires every 1.5s to detect missed discovery beats
+    bool m_keyboardShortcutsEnabled{false}; // global enable for keyboard shortcuts (View menu)
+    bool m_spacePttActive{false};          // true while Space is held for PTT
+    ShortcutManager m_shortcutManager;
 
 #ifdef HAVE_RADE
     RADEEngine* m_radeEngine{nullptr};
@@ -166,6 +232,7 @@ private:
 #if defined(Q_OS_MAC) || defined(HAVE_PIPEWIRE)
     DaxBridge* m_daxBridge{nullptr};
     QString m_savedMicSelection;  // restore on stopDax
+    bool m_savedDaxEnabled{false}; // restore on stopDax
     void startDax();
     void stopDax();
 #endif

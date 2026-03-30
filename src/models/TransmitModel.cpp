@@ -8,6 +8,29 @@ TransmitModel::TransmitModel(QObject* parent)
     : QObject(parent)
 {}
 
+void TransmitModel::resetState()
+{
+    m_apdEnabled = false;
+    m_apdConfigurable = false;
+    m_apdEqActive = false;
+    m_rfPower = 100;
+    m_tunePower = 10;
+    m_tune = false;
+    m_mox = false;
+    m_transmitting = false;
+    m_maxPowerLevel = 100;
+    m_atuEnabled = false;
+    m_atuStatus = ATUStatus::None;
+    m_memoriesEnabled = false;
+    m_usingMemory = false;
+    m_showTxInWaterfall = false;
+
+    emit apdStateChanged();
+    emit moxChanged(false);
+    emit tuneChanged(false);
+    emit micStateChanged();
+}
+
 // ── Status parsing ──────────────────────────────────────────────────────────
 
 void TransmitModel::applyTransmitStatus(const QMap<QString, QString>& kvs)
@@ -26,6 +49,10 @@ void TransmitModel::applyTransmitStatus(const QMap<QString, QString>& kvs)
     if (kvs.contains("tune")) {
         bool v = kvs["tune"] == "1";
         if (m_tune != v) { m_tune = v; changed = true; tuneChanged_ = true; }
+    }
+    if (kvs.contains("mox")) {
+        bool v = kvs["mox"] == "1";
+        if (m_mox != v) { m_mox = v; changed = true; }
     }
 
     // ── Mic / monitor / processor keys ──────────────────────────────────────
@@ -292,12 +319,11 @@ void TransmitModel::stopTune()
 
 void TransmitModel::setMox(bool on)
 {
-    // Immediately gate TX audio when turning off MOX — don't wait for
-    // the radio's interlock state to reach READY (which can take 7–15 s
-    // through UNKEY_REQUESTED, causing "stuck TX").
-    if (!on && m_transmitting) {
-        m_transmitting = false;
-        emit moxChanged(false);
+    // Optimistic MOX edge gating keeps UI/audio aligned with user intent.
+    // Interlock status from the radio will still reconcile final state.
+    if (m_transmitting != on) {
+        m_transmitting = on;
+        emit moxChanged(on);
     }
     emit commandReady(QString("xmit %1").arg(on ? 1 : 0));
 }

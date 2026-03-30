@@ -3,6 +3,8 @@
 #include <QWidget>
 
 class QLabel;
+class QPushButton;
+class QSlider;
 class QTextEdit;
 
 namespace AetherSDR {
@@ -27,17 +29,22 @@ public:
 
     // Set the slice ID (0=A, 1=B, 2=C, 3=D) shown in the title bar.
     void setSliceId(int id);
+    void clearSliceTitle();
 
     // CW decode panel
     void setCwPanelVisible(bool visible);
     void appendCwText(const QString& text, float cost = 0.0f);
     void setCwStats(float pitchHz, float speedWpm);
     void clearCwText();
+    QPushButton* lockPitchButton() const { return m_lockPitchBtn; }
+    QPushButton* lockSpeedButton() const { return m_lockSpeedBtn; }
 
     QSize sizeHint() const override { return {800, 316}; }
 
 signals:
     void activated(const QString& panId);
+    void closeRequested(const QString& panId);
+    void pitchRangeChanged(int minHz, int maxHz);
 
 protected:
     bool eventFilter(QObject* obj, QEvent* ev) override;
@@ -51,6 +58,14 @@ private:
     QWidget*   m_cwPanel{nullptr};
     QTextEdit* m_cwText{nullptr};
     QLabel*    m_cwStatsLabel{nullptr};
+    QSlider*      m_cwSensSlider{nullptr};
+    QPushButton*  m_lockPitchBtn{nullptr};
+    QPushButton*  m_lockSpeedBtn{nullptr};
+    QSlider*      m_pitchMinSlider{nullptr};
+    QSlider*      m_pitchMaxSlider{nullptr};
+    QLabel*       m_pitchMinValLabel{nullptr};
+    QLabel*       m_pitchMaxValLabel{nullptr};
+    float         m_cwCostThreshold{0.70f};
 };
 
 } // namespace AetherSDR

@@ -10,8 +10,20 @@
 #include <QWheelEvent>
 #include <QMenu>
 #include <QToolTip>
+#include <QDialog>
+#include <QFormLayout>
+#include <QLineEdit>
+#include <QComboBox>
+#include <QCheckBox>
+#include <QDialogButtonBox>
+#include <QLabel>
+#include <QApplication>
+#include <QClipboard>
+#include <QDesktopServices>
+#include <QUrl>
 #include "core/AppSettings.h"
 #include "models/BandPlan.h"
+#include "models/BandDefs.h"
 #include <QDateTime>
 #include <cmath>
 #include <cstring>
@@ -38,6 +50,32 @@ SpectrumWidget::SpectrumWidget(QWidget* parent)
 
     // VFO widgets are created per-slice via addVfoWidget().
     // m_vfoWidget is set by setActiveVfoWidget() as an alias to the active one.
+
+    // Bottom-left waterfall zoom buttons
+    static const QString kZoomBtnStyle =
+        "QPushButton { background: rgba(15,15,26,180); border: 1px solid #304050;"
+        " border-radius: 2px; color: #90a0b0; font-size: 11px; font-weight: bold;"
+        " padding: 0; margin: 0; min-width: 0; }"
+        "QPushButton:hover { background: rgba(30,50,70,200); color: #c8d8e8; }"
+        "QPushButton:pressed { background: #00b4d8; color: #000; }";
+
+    auto makeBtn = [&](const QString& text) {
+        auto* btn = new QPushButton(text, this);
+        btn->setFixedSize(22, 22);
+        btn->setStyleSheet(kZoomBtnStyle);
+        btn->setCursor(Qt::PointingHandCursor);
+        return btn;
+    };
+    m_zoomSegBtn  = makeBtn("S");
+    m_zoomBandBtn = makeBtn("B");
+
+    // SmartSDR pcap: B sends "band_zoom=1", S sends "segment_zoom=1"
+    connect(m_zoomBandBtn, &QPushButton::clicked, this, [this]() {
+        emit bandZoomRequested();
+    });
+    connect(m_zoomSegBtn, &QPushButton::clicked, this, [this]() {
+        emit segmentZoomRequested();
+    });
 }
 
 // ── Multi-VfoWidget management ────────────────────────────────────────────────
@@ -70,7 +108,13 @@ void SpectrumWidget::loadSettings()
     m_wfBlackLevel   = s.value(settingsKey("DisplayWfBlackLevel"), "15").toInt();
     m_wfAutoBlack    = s.value(settingsKey("DisplayWfAutoBlack"), "True").toString() == "True";
     m_wfLineDuration = s.value(settingsKey("DisplayWfLineDuration"), "100").toInt();
-    m_showBandPlan   = s.value("ShowBandPlan", "True").toString() == "True";
+    // Migrate old ShowBandPlan bool → BandPlanFontSize int
+    if (s.value("BandPlanFontSize").toString().isEmpty()) {
+        m_bandPlanFontSize = s.value("ShowBandPlan", "True").toString() == "True" ? 6 : 0;
+    } else {
+        m_bandPlanFontSize = s.value("BandPlanFontSize", "6").toInt();
+    }
+    m_singleClickTune = s.value("SingleClickTune", "False").toString() == "True";
 
     // Sync overlay menu sliders with restored settings
     if (m_overlayMenu)
@@ -185,6 +229,11 @@ void SpectrumWidget::resetWfTimeScale() {
 
 void SpectrumWidget::setFrequencyRange(double centerMhz, double bandwidthMhz)
 {
+    if (centerMhz != m_centerMhz || bandwidthMhz != m_bandwidthMhz)
+        qDebug() << "SpectrumWidget::setFrequencyRange center="
+                 << QString::number(centerMhz, 'f', 6)
+                 << "bw=" << QString::number(bandwidthMhz, 'f', 6)
+                 << "bins=" << m_smoothed.size();
     m_centerMhz    = centerMhz;
     m_bandwidthMhz = bandwidthMhz;
     update();
@@ -255,6 +304,16 @@ void SpectrumWidget::setSliceOverlay(int sliceId, double freq, int fLow, int fHi
         o.xitOn = xitOn; o.xitFreq = xitFreq;
     }
     update();
+}
+
+void SpectrumWidget::setSliceOverlayFreq(int sliceId, double freqMhz)
+{
+    for (auto& so : m_sliceOverlays) {
+        if (so.sliceId == sliceId) {
+            so.freqMhz = freqMhz;
+            return;
+        }
+    }
 }
 
 void SpectrumWidget::removeSliceOverlay(int sliceId)
@@ -500,8 +559,11 @@ void SpectrumWidget::updateWaterfallRow(const QVector<float>& binsIntensity,
 
 int SpectrumWidget::mhzToX(double mhz) const
 {
+    if (m_bandwidthMhz <= 0.0) return -1;
     const double startMhz = m_centerMhz - m_bandwidthMhz / 2.0;
-    return static_cast<int>((mhz - startMhz) / m_bandwidthMhz * width());
+    const double px = (mhz - startMhz) / m_bandwidthMhz * width();
+    if (std::isnan(px) || std::isinf(px)) return -1;
+    return static_cast<int>(std::clamp(px, -1.0e6, 1.0e6));
 }
 
 double SpectrumWidget::xToMhz(int x) const
@@ -526,6 +588,33 @@ void SpectrumWidget::mousePressEvent(QMouseEvent* ev)
     const int contentH = height() - chromeH;
     const int specH = static_cast<int>(contentH * m_spectrumFrac);
     const int y = static_cast<int>(ev->position().y());
+
+    // Save press position for single-click-to-tune drag threshold
+    if (ev->button() == Qt::LeftButton)
+        m_clickPressPos = ev->position().toPoint();
+
+    // Click on a spot label → tune to that frequency
+    if (m_showSpots && ev->button() == Qt::LeftButton) {
+        const QPoint pos(static_cast<int>(ev->position().x()), y);
+        for (const auto& hr : m_spotClickRects) {
+            if (hr.rect.contains(pos)) {
+                emit frequencyClicked(hr.freqMhz);
+                // Notify the radio that a spot was clicked (#341)
+                if (hr.markerIndex >= 0 && hr.markerIndex < m_spotMarkers.size())
+                    emit spotTriggered(m_spotMarkers[hr.markerIndex].index);
+                ev->accept();
+                return;
+            }
+        }
+        // Click on a cluster badge → show popup with collapsed spots
+        for (const auto& cluster : m_spotClusters) {
+            if (cluster.rect.contains(pos)) {
+                showSpotClusterPopup(cluster, mapToGlobal(pos));
+                ev->accept();
+                return;
+            }
+        }
+    }
 
     // Click on the divider bar → start split drag
     if (y >= specH && y < specH + DIVIDER_H) {
@@ -611,8 +700,40 @@ void SpectrumWidget::mousePressEvent(QMouseEvent* ev)
         const double freqMhz = xToMhz(mx);
         const int hitTnf = tnfAtPixel(mx);
 
+        // Check if right-click is on an existing spot label
+        int hitSpotIdx = -1;
+        QString hitSpotCall;
+        double hitSpotFreq = 0;
+        for (const auto& hr : m_spotClickRects) {
+            if (hr.rect.contains(mx, static_cast<int>(ev->position().y()))) {
+                if (hr.markerIndex >= 0 && hr.markerIndex < m_spotMarkers.size()) {
+                    const auto& sm = m_spotMarkers[hr.markerIndex];
+                    hitSpotIdx = sm.index;
+                    hitSpotCall = sm.callsign;
+                    hitSpotFreq = sm.freqMhz;
+                }
+                break;
+            }
+        }
+
         QMenu menu(this);
-        if (hitTnf >= 0) {
+
+        // Spot-on-label context menu
+        if (hitSpotIdx >= 0) {
+            menu.addAction(QString("Tune to %1").arg(hitSpotCall), this,
+                [this, hitSpotFreq]{ emit frequencyClicked(hitSpotFreq); });
+            menu.addAction("Copy Callsign", this, [hitSpotCall]{
+                QApplication::clipboard()->setText(hitSpotCall);
+            });
+            menu.addAction("Lookup on QRZ", this, [hitSpotCall]{
+                QDesktopServices::openUrl(QUrl("https://www.qrz.com/db/" + hitSpotCall));
+            });
+            menu.addSeparator();
+            menu.addAction("Remove Spot", this,
+                [this, hitSpotIdx]{ emit spotRemoveRequested(hitSpotIdx); });
+        }
+        // TNF context menu (when clicking on a TNF marker)
+        else if (hitTnf >= 0) {
             menu.addAction("Remove TNF", this, [this, hitTnf]{ emit tnfRemoveRequested(hitTnf); });
             auto* widthMenu = menu.addMenu("Width");
             for (int w : {50, 100, 200, 500}) {
@@ -624,7 +745,6 @@ void SpectrumWidget::mousePressEvent(QMouseEvent* ev)
             depthMenu->addAction("Deep", this, [this, hitTnf]{ emit tnfDepthRequested(hitTnf, 2); });
             depthMenu->addAction("Very Deep", this, [this, hitTnf]{ emit tnfDepthRequested(hitTnf, 3); });
             menu.addSeparator();
-            // Find current permanent state
             bool isPerm = false;
             for (const auto& t : m_tnfMarkers)
                 if (t.id == hitTnf) { isPerm = t.permanent; break; }
@@ -632,8 +752,18 @@ void SpectrumWidget::mousePressEvent(QMouseEvent* ev)
                 menu.addAction("Make Temporary", this, [this, hitTnf]{ emit tnfPermanentRequested(hitTnf, false); });
             else
                 menu.addAction("Make Permanent", this, [this, hitTnf]{ emit tnfPermanentRequested(hitTnf, true); });
-        } else {
-            const QString freqStr = QString::number(freqMhz, 'f', 6);
+        }
+        // General area context menu
+        else {
+            // Snap frequency to step size for spot placement
+            double snappedMhz = freqMhz;
+            if (m_stepHz > 0) {
+                const double stepMhz = m_stepHz / 1e6;
+                snappedMhz = std::round(freqMhz / stepMhz) * stepMhz;
+            }
+            const QString freqStr = QString::number(snappedMhz, 'f', 6);
+            menu.addAction(QString("Add Spot at %1 MHz...").arg(freqStr), this,
+                [this, snappedMhz]{ showAddSpotDialog(snappedMhz); });
             menu.addAction(QString("Add TNF at %1 MHz").arg(freqStr), this,
                 [this, freqMhz]{ emit tnfCreateRequested(freqMhz); });
         }
@@ -641,7 +771,6 @@ void SpectrumWidget::mousePressEvent(QMouseEvent* ev)
         // Close Slice option (only when multiple slices exist)
         if (m_sliceOverlays.size() > 1) {
             menu.addSeparator();
-            // Find which slice the click is nearest to
             int closestSlice = -1;
             int closestDist = INT_MAX;
             for (const auto& so : m_sliceOverlays) {
@@ -713,6 +842,16 @@ void SpectrumWidget::mousePressEvent(QMouseEvent* ev)
         }
         if (std::abs(mx - hiX) <= GRAB) {
             m_draggingFilter = FilterEdge::High;
+            setCursor(Qt::SizeHorCursor);
+            ev->accept();
+            return;
+        }
+
+        // Click inside the filter passband → start VFO drag (#404)
+        const int left = std::min(loX, hiX);
+        const int right = std::max(loX, hiX);
+        if (mx > left + GRAB && mx < right - GRAB) {
+            m_draggingVfo = true;
             setCursor(Qt::SizeHorCursor);
             ev->accept();
             return;
@@ -819,6 +958,14 @@ void SpectrumWidget::mouseMoveEvent(QMouseEvent* ev)
         return;
     }
 
+    if (m_draggingVfo) {
+        const int mx = static_cast<int>(ev->position().x());
+        const double mhz = snapToStep(xToMhz(mx), m_stepHz);
+        emit frequencyClicked(mhz);
+        ev->accept();
+        return;
+    }
+
     if (m_draggingPan) {
         const int dx = static_cast<int>(ev->position().x()) - m_panDragStartX;
         // Dragging right moves the view right → center shifts left
@@ -889,6 +1036,45 @@ void SpectrumWidget::mouseMoveEvent(QMouseEvent* ev)
                         }
                     }
                 }
+                if (!foundCursor && m_showSpots) {
+                    bool spotHover = false;
+                    for (const auto& hr : m_spotClickRects) {
+                        if (hr.rect.contains(pos)) {
+                            setCursor(Qt::PointingHandCursor);
+                            foundCursor = true;
+                            // Show spot tooltip
+                            if (hr.markerIndex >= 0 && hr.markerIndex < m_spotMarkers.size()) {
+                                const auto& sm = m_spotMarkers[hr.markerIndex];
+                                QString tip = QString("<b>%1</b>  %2 MHz")
+                                    .arg(sm.callsign)
+                                    .arg(sm.freqMhz, 0, 'f', 4);
+                                if (!sm.source.isEmpty())
+                                    tip += QString("<br>Source: %1").arg(sm.source);
+                                if (!sm.spotterCallsign.isEmpty())
+                                    tip += QString("<br>Spotter: %1").arg(sm.spotterCallsign);
+                                if (!sm.comment.isEmpty())
+                                    tip += QString("<br>%1").arg(sm.comment);
+                                if (sm.timestamp.isValid() && sm.timestamp.toMSecsSinceEpoch() > 0)
+                                    tip += QString("<br>Spotted: %1 UTC").arg(
+                                        sm.timestamp.toUTC().toString("yyyy-MM-dd HH:mm:ss"));
+                                QToolTip::showText(ev->globalPosition().toPoint(), tip, this);
+                            }
+                            spotHover = true;
+                            break;
+                        }
+                    }
+                    if (!spotHover)
+                        QToolTip::hideText();
+                    if (!foundCursor) {
+                        for (const auto& cluster : m_spotClusters) {
+                            if (cluster.rect.contains(pos)) {
+                                setCursor(Qt::PointingHandCursor);
+                                foundCursor = true;
+                                break;
+                            }
+                        }
+                    }
+                }
                 if (!foundCursor) setCursor(Qt::CrossCursor);
             }
         }
@@ -954,6 +1140,12 @@ void SpectrumWidget::mouseReleaseEvent(QMouseEvent* ev)
         ev->accept();
         return;
     }
+    if (m_draggingVfo) {
+        m_draggingVfo = false;
+        setCursor(Qt::CrossCursor);
+        ev->accept();
+        return;
+    }
     if (m_draggingFilter != FilterEdge::None) {
         m_draggingFilter = FilterEdge::None;
         setCursor(Qt::CrossCursor);
@@ -963,8 +1155,105 @@ void SpectrumWidget::mouseReleaseEvent(QMouseEvent* ev)
     if (m_draggingPan) {
         m_draggingPan = false;
         setCursor(Qt::CrossCursor);
+
+        // Single-click-to-tune: if the mouse didn't move during the
+        // "pan drag", treat it as a click-to-tune instead
+        if (m_singleClickTune && ev->button() == Qt::LeftButton) {
+            QPoint delta = ev->position().toPoint() - m_clickPressPos;
+            if (delta.manhattanLength() <= 4) {
+                const int mx = static_cast<int>(ev->position().x());
+                if (mx < width() - DBM_STRIP_W) {
+                    double rawMhz = xToMhz(mx);
+                    emit frequencyClicked(snapToStep(rawMhz, m_stepHz));
+                }
+            }
+        }
         ev->accept();
+        return;
     }
+
+    // Single-click-to-tune in FFT area (not consumed by pan drag)
+    if (m_singleClickTune && ev->button() == Qt::LeftButton) {
+        QPoint delta = ev->position().toPoint() - m_clickPressPos;
+        if (delta.manhattanLength() <= 4) {
+            const int mx = static_cast<int>(ev->position().x());
+            if (mx < width() - DBM_STRIP_W) {
+                double rawMhz = xToMhz(mx);
+                emit frequencyClicked(snapToStep(rawMhz, m_stepHz));
+                ev->accept();
+                return;
+            }
+        }
+    }
+}
+
+void SpectrumWidget::showAddSpotDialog(double freqMhz)
+{
+    // Snap to step size
+    if (m_stepHz > 0) {
+        const double stepMhz = m_stepHz / 1e6;
+        freqMhz = std::round(freqMhz / stepMhz) * stepMhz;
+    }
+    auto& as = AppSettings::instance();
+    QDialog dlg(this);
+    dlg.setWindowTitle("Add Spot");
+    dlg.setStyleSheet("QDialog { background: #1a1a2e; color: #c8d8e8; }"
+                      "QLineEdit { background: #0f0f1a; color: #c8d8e8; border: 1px solid #304060; padding: 4px; }"
+                      "QComboBox { background: #0f0f1a; color: #c8d8e8; border: 1px solid #304060; padding: 4px; }"
+                      "QLabel { color: #c8d8e8; }"
+                      "QCheckBox { color: #c8d8e8; }");
+
+    auto* layout = new QFormLayout(&dlg);
+
+    auto* freqLabel = new QLabel(QString("%1 MHz").arg(freqMhz, 0, 'f', 6));
+    layout->addRow("Frequency:", freqLabel);
+
+    auto* callEdit = new QLineEdit;
+    callEdit->setPlaceholderText("Callsign (required)");
+    layout->addRow("Callsign:", callEdit);
+
+    auto* commentEdit = new QLineEdit;
+    commentEdit->setPlaceholderText("Optional comment");
+    layout->addRow("Comment:", commentEdit);
+
+    auto* lifetimeCombo = new QComboBox;
+    lifetimeCombo->addItem("5 minutes", 300);
+    lifetimeCombo->addItem("15 minutes", 900);
+    lifetimeCombo->addItem("30 minutes", 1800);
+    lifetimeCombo->addItem("1 hour", 3600);
+    lifetimeCombo->addItem("2 hours", 7200);
+    int defaultLifetime = as.value("ManualSpotLifetime", 1800).toInt();
+    for (int i = 0; i < lifetimeCombo->count(); ++i) {
+        if (lifetimeCombo->itemData(i).toInt() == defaultLifetime) {
+            lifetimeCombo->setCurrentIndex(i);
+            break;
+        }
+    }
+    layout->addRow("Lifetime:", lifetimeCombo);
+
+    auto* forwardCheck = new QCheckBox("Forward to DX Cluster");
+    forwardCheck->setChecked(as.value("SpotForwardToCluster", "False").toString() == "True");
+    layout->addRow("", forwardCheck);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    layout->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    const QString callsign = callEdit->text().trimmed().toUpper();
+    if (callsign.isEmpty()) return;
+
+    const QString comment = commentEdit->text().trimmed();
+    const int lifetimeSec = lifetimeCombo->currentData().toInt();
+    const bool forward = forwardCheck->isChecked();
+
+    // Remember preferences
+    as.setValue("ManualSpotLifetime", QString::number(lifetimeSec));
+    as.setValue("SpotForwardToCluster", forward ? "True" : "False");
+
+    emit spotAddRequested(freqMhz, callsign, comment, lifetimeSec, forward);
 }
 
 void SpectrumWidget::mouseDoubleClickEvent(QMouseEvent* ev)
@@ -1025,12 +1314,32 @@ void SpectrumWidget::wheelEvent(QWheelEvent* ev)
         return;
     }
 
-    const int ticks = ev->angleDelta().y() / 120;   // +1 per notch up, -1 per notch down
-    if (ticks == 0) { ev->ignore(); return; }
+    // Handle both trackpad (pixelDelta) and mouse wheel (angleDelta)
+    int steps = 0;
+    if (!ev->pixelDelta().isNull()) {
+        // Trackpad: accumulate pixel delta; 1 step per ~15px
+        // Ignore momentum (inertial) scrolling
+        if (ev->phase() == Qt::ScrollMomentum) { ev->accept(); return; }
+        // Ignore horizontal-dominant swipes
+        if (qAbs(ev->pixelDelta().x()) > qAbs(ev->pixelDelta().y())) {
+            ev->ignore(); return;
+        }
+        m_scrollAccum += ev->pixelDelta().y();
+        steps = m_scrollAccum / 15;
+        m_scrollAccum -= steps * 15;
+    } else {
+        // Standard mouse wheel: angleDelta is in 1/8° units, one notch = 120.
+        // Some desktops (KDE Plasma, Cinnamon) send high-resolution deltas
+        // (e.g. 960 per notch). Accumulate and divide to normalize. (#390)
+        m_angleAccum += ev->angleDelta().y();
+        steps = m_angleAccum / 120;
+        m_angleAccum -= steps * 120;
+    }
+    if (steps == 0) { ev->ignore(); return; }
 
     const auto* ao = activeOverlay();
     const double vfoMhz = ao ? ao->freqMhz : m_centerMhz;
-    const double newMhz = snapToStep(vfoMhz + ticks * m_stepHz / 1e6, m_stepHz);
+    const double newMhz = snapToStep(vfoMhz + steps * m_stepHz / 1e6, m_stepHz);
     emit frequencyClicked(newMhz);
     ev->accept();
 }
@@ -1051,6 +1360,19 @@ void SpectrumWidget::resizeEvent(QResizeEvent* ev)
             newWf = m_waterfall.scaled(width(), wfHeight, Qt::IgnoreAspectRatio, Qt::FastTransformation);
         m_waterfall = newWf;
     }
+
+    positionZoomButtons();
+}
+
+void SpectrumWidget::positionZoomButtons()
+{
+    constexpr int pad = 4;
+    constexpr int sz = 22;
+    const int botY = height() - pad;
+
+    // S | B at bottom-left
+    m_zoomSegBtn->move(pad, botY - sz);
+    m_zoomBandBtn->move(pad + sz + 2, botY - sz);
 }
 
 // ─── Colour map ───────────────────────────────────────────────────────────────
@@ -1190,7 +1512,7 @@ void SpectrumWidget::paintEvent(QPaintEvent*)
 
     drawGrid(p, specRect);
     drawSpectrum(p, specRect);
-    if (m_showBandPlan) drawBandPlan(p, specRect);
+    if (m_bandPlanFontSize > 0) drawBandPlan(p, specRect);
     drawDbmScale(p, specRect);
 
     // Draggable divider bar
@@ -1202,6 +1524,7 @@ void SpectrumWidget::paintEvent(QPaintEvent*)
     drawWaterfall(p, wfRect);
     drawTimeScale(p, wfRect);
     drawTnfMarkers(p, specRect, wfRect);
+    if (m_showSpots) drawSpotMarkers(p, specRect);
     drawSliceMarkers(p, specRect, wfRect);
     drawOffScreenSlices(p, specRect);
 
@@ -1431,7 +1754,7 @@ void SpectrumWidget::drawBandPlan(QPainter& p, const QRect& specRect)
 {
     const double startMhz = m_centerMhz - m_bandwidthMhz / 2.0;
     const double endMhz   = m_centerMhz + m_bandwidthMhz / 2.0;
-    const int bandH = 8;
+    const int bandH = m_bandPlanFontSize + 4;  // scale strip height with font
     const int bandY = specRect.bottom() - bandH + 1;
 
     for (int i = 0; i < kBandPlanCount; ++i) {
@@ -1461,7 +1784,7 @@ void SpectrumWidget::drawBandPlan(QPainter& p, const QRect& specRect)
         // Label: mode + lowest license class allowed
         if (x2 - x1 > 20) {
             QFont f = p.font();
-            f.setPointSize(6);
+            f.setPointSize(m_bandPlanFontSize);
             f.setBold(true);
             p.setFont(f);
 
@@ -1499,6 +1822,12 @@ void SpectrumWidget::drawBandPlan(QPainter& p, const QRect& specRect)
 void SpectrumWidget::setTnfMarkers(const QVector<TnfMarker>& markers)
 {
     m_tnfMarkers = markers;
+    update();
+}
+
+void SpectrumWidget::setSpotMarkers(const QVector<SpotMarker>& markers)
+{
+    m_spotMarkers = markers;
     update();
 }
 
@@ -1563,6 +1892,176 @@ int SpectrumWidget::tnfAtPixel(int x) const
 }
 
 // ─── VFO marker (filter passband + tuned frequency line) ──────────────────────
+
+void SpectrumWidget::drawSpotMarkers(QPainter& p, const QRect& specRect)
+{
+    if (m_spotMarkers.isEmpty()) return;
+
+    QFont spotFont = p.font();
+    spotFont.setPixelSize(m_spotFontSize);
+    spotFont.setBold(true);
+    p.setFont(spotFont);
+    const QFontMetrics fm(spotFont);
+
+    // Starting Y position based on percentage setting
+    const int startY = specRect.top() + specRect.height() * m_spotStartPct / 100;
+    const int th = fm.height() + 2;
+    const int maxBottom = startY + th * m_spotMaxLevels;
+
+    // Track label positions to avoid overlap and for click detection
+    QVector<QRect> placed;
+    m_spotClickRects.clear();
+    m_spotClusters.clear();
+
+    // Track which spots overflow (can't be placed within max levels)
+    // Key: x pixel position (quantized to label width), Value: list of overflowed spots
+    QMap<int, QVector<SpotMarker>> overflowGroups;
+    constexpr int ClusterBinWidth = 40;  // pixels — spots within this range cluster together
+
+    for (const auto& spot : m_spotMarkers) {
+        const int x = mhzToX(spot.freqMhz);
+        if (x < 0 || x > width()) continue;
+
+        // Color: override uses m_spotColor, otherwise use spot-provided or default cyan
+        QColor col(0x00, 0xb4, 0xd8);  // default cyan
+        if (m_spotOverrideColors) {
+            col = m_spotColor;
+        } else if (!spot.color.isEmpty() && spot.color.startsWith('#')) {
+            QColor parsed(spot.color);
+            if (parsed.isValid()) col = parsed;
+        }
+
+        // Draw callsign label
+        const QString label = spot.callsign;
+        const int tw = fm.horizontalAdvance(label) + 6;
+
+        // Start at configured position, nudge down to avoid overlap.
+        // Re-scan from the start after each nudge to handle cases where
+        // nudging past label A lands on top of label B.
+        QRect labelRect(x - tw / 2, startY, tw, th);
+        bool collision = true;
+        while (collision) {
+            collision = false;
+            for (const auto& r : placed) {
+                if (labelRect.intersects(r)) {
+                    labelRect.moveTop(r.bottom() + 1);
+                    collision = true;
+                    break;
+                }
+            }
+        }
+        // Overflow — collect for cluster badge
+        if (labelRect.bottom() > maxBottom) {
+            int bin = x / ClusterBinWidth;
+            overflowGroups[bin].append(spot);
+            continue;
+        }
+
+        // Draw vertical tick line from bottom of spectrum up to the label
+        p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), 120), 1, Qt::DotLine));
+        p.drawLine(x, specRect.bottom(), x, labelRect.bottom());
+
+        placed.append(labelRect);
+        int mIdx = static_cast<int>(&spot - &m_spotMarkers[0]);
+        m_spotClickRects.append({labelRect, spot.freqMhz, mIdx});
+
+        // Background pill
+        int bgAlpha = m_spotBgOpacity * 255 / 100;
+        QColor bgCol = m_spotBgColor;
+        bgCol.setAlpha(bgAlpha);
+        p.setPen(Qt::NoPen);
+        p.setBrush(bgCol);
+        p.drawRoundedRect(labelRect, 3, 3);
+
+        // Text
+        p.setPen(col);
+        p.drawText(labelRect, Qt::AlignCenter, label);
+    }
+
+    // Draw cluster badges for overflow groups
+    if (!overflowGroups.isEmpty()) {
+        QFont badgeFont = spotFont;
+        badgeFont.setPixelSize(m_spotFontSize - 2);
+        p.setFont(badgeFont);
+        const QFontMetrics bfm(badgeFont);
+
+        for (auto it = overflowGroups.constBegin(); it != overflowGroups.constEnd(); ++it) {
+            const auto& spots = it.value();
+            if (spots.isEmpty()) continue;
+
+            // Position badge at average x of the group, at maxBottom
+            int avgX = 0;
+            for (const auto& s : spots)
+                avgX += mhzToX(s.freqMhz);
+            avgX /= spots.size();
+
+            const QString badgeText = QString("+%1").arg(spots.size());
+            const int bw = bfm.horizontalAdvance(badgeText) + 10;
+            QRect badgeRect(avgX - bw / 2, maxBottom + 2, bw, th);
+
+            // Nudge horizontally to avoid overlapping other badges/labels
+            for (const auto& r : placed) {
+                if (badgeRect.intersects(r))
+                    badgeRect.moveLeft(r.right() + 3);
+            }
+            placed.append(badgeRect);
+
+            // Draw badge with distinct style
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(0x30, 0x50, 0x70, 200));
+            p.drawRoundedRect(badgeRect, 3, 3);
+
+            p.setPen(QColor(0xff, 0xc0, 0x40));  // amber text
+            p.drawText(badgeRect, Qt::AlignCenter, badgeText);
+
+            // Store for click detection
+            SpotCluster cluster;
+            cluster.rect = badgeRect;
+            cluster.spots = spots;
+            m_spotClusters.append(cluster);
+        }
+
+        p.setFont(spotFont);  // restore spot font
+    }
+
+    p.setFont(QFont());  // restore default
+}
+
+void SpectrumWidget::showSpotClusterPopup(const SpotCluster& cluster, const QPoint& globalPos)
+{
+    auto* menu = new QMenu(this);
+    menu->setStyleSheet(
+        "QMenu {"
+        "  background: #0f0f1a;"
+        "  border: 1px solid #305070;"
+        "  padding: 4px;"
+        "}"
+        "QMenu::item {"
+        "  color: #c8d8e8;"
+        "  padding: 4px 12px;"
+        "  font-size: 12px;"
+        "}"
+        "QMenu::item:selected {"
+        "  background: #1a3a5a;"
+        "  color: #00b4d8;"
+        "}");
+
+    for (const auto& spot : cluster.spots) {
+        QString text = QString("%1  %2 kHz")
+            .arg(spot.callsign, -10)
+            .arg(spot.freqMhz * 1000.0, 0, 'f', 1);
+        if (!spot.mode.isEmpty())
+            text += "  " + spot.mode;
+        auto* action = menu->addAction(text);
+        connect(action, &QAction::triggered, this, [this, freq = spot.freqMhz] {
+            emit frequencyClicked(freq);
+        });
+    }
+
+    menu->popup(globalPos);
+    // QMenu self-deletes on close with WA_DeleteOnClose
+    menu->setAttribute(Qt::WA_DeleteOnClose);
+}
 
 void SpectrumWidget::drawSliceMarkers(QPainter& p, const QRect& specRect, const QRect& wfRect)
 {

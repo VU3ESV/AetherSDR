@@ -16,24 +16,47 @@ void MeterModel::defineMeter(const MeterDef& def)
     // Cache indices for high-frequency lookups
     if (def.source == "SLC" && def.name == "LEVEL")
         m_sLevelIdxBySlice[def.sourceIndex] = def.index;
-    else if (def.name == "FWDPWR")
+    else if (def.source == "SLC" && def.name == "ESC")
+        m_escLevelIdxBySlice[def.sourceIndex] = def.index;
+    else if (def.source.startsWith("TX") && def.name == "FWDPWR")
         m_fwdPwrIdx = def.index;
-    else if (def.name == "SWR")
+    else if (def.source.startsWith("TX") && def.name == "SWR")
         m_swrIdx = def.index;
     else if (def.name == "MICPEAK")
         m_micPeakIdx = def.index;
     else if (def.name == "COMPPEAK")
         m_compPeakIdx = def.index;
+    else if (def.name == "AFTEREQ")
+        m_afterEqIdx = def.index;
     else if (def.name == "MIC")
         m_micLevelIdx = def.index;
     else if (def.name == "COMP")
         m_compLevelIdx = def.index;
     else if (def.name == "HWALC")
         m_alcIdx = def.index;
-    else if (def.name == "PATEMP")
+    else if (def.source != "AMP" && def.name == "PATEMP")
         m_paTempIdx = def.index;
     else if (def.name == "+13.8A")
         m_supplyIdx = def.index;
+    // Amplifier meters (source "AMP")
+    // Multiple FWD/RL meters exist — one per amplifier handle.
+    // TGXL meters go to TunerApplet (m_tgxlFwd/SwrIdx).
+    // PGXL meters go to AmpApplet (m_ampFwdPwrIdx/SwrIdx/TempIdx).
+    // Distinguish by matching def.sourceIndex against the known TGXL handle.
+    else if (def.source == "AMP" && def.name == "FWD" && def.unit == "dBm") {
+        if (m_tgxlHandle != 0 && def.sourceIndex == m_tgxlHandle)
+            m_tgxlFwdIdx = def.index;
+        else
+            m_ampFwdPwrIdx = def.index;
+    }
+    else if (def.source == "AMP" && def.name == "RL") {
+        if (m_tgxlHandle != 0 && def.sourceIndex == m_tgxlHandle)
+            m_tgxlSwrIdx = def.index;
+        else
+            m_ampSwrIdx = def.index;
+    }
+    else if (def.source == "AMP" && def.name == "TEMP")
+        m_ampTempIdx = def.index;
 
     qCDebug(lcMeters) << "MeterModel: defined meter" << def.index
              << def.source << def.sourceIndex << def.name
@@ -50,15 +73,23 @@ void MeterModel::removeMeter(int index)
         if (it.value() == index) it = m_sLevelIdxBySlice.erase(it);
         else ++it;
     }
+    for (auto it = m_escLevelIdxBySlice.begin(); it != m_escLevelIdxBySlice.end(); ) {
+        if (it.value() == index) it = m_escLevelIdxBySlice.erase(it);
+        else ++it;
+    }
     if (index == m_fwdPwrIdx)   m_fwdPwrIdx = -1;
     if (index == m_swrIdx)      m_swrIdx = -1;
     if (index == m_micPeakIdx)   m_micPeakIdx = -1;
     if (index == m_compPeakIdx)  m_compPeakIdx = -1;
+    if (index == m_afterEqIdx)   m_afterEqIdx = -1;
     if (index == m_micLevelIdx)  m_micLevelIdx = -1;
     if (index == m_compLevelIdx) m_compLevelIdx = -1;
     if (index == m_alcIdx)       m_alcIdx = -1;
     if (index == m_paTempIdx)    m_paTempIdx = -1;
     if (index == m_supplyIdx)    m_supplyIdx = -1;
+    if (index == m_ampFwdPwrIdx) m_ampFwdPwrIdx = -1;
+    if (index == m_ampSwrIdx)    m_ampSwrIdx = -1;
+    if (index == m_ampTempIdx)   m_ampTempIdx = -1;
 }
 
 float MeterModel::convertRaw(const MeterDef& def, qint16 raw) const
@@ -83,6 +114,8 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
     bool micChanged = false;
     bool alcChanged = false;
     bool hwChanged = false;
+    bool ampChanged = false;
+    bool tgxlChanged = false;
 
     for (int i = 0; i < n; ++i) {
         const int idx = static_cast<int>(ids[i]);
@@ -101,6 +134,16 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
                 break;
             }
         }
+        // Check if this meter is a per-slice ESC meter
+        if (!isSliceLevel) {
+            for (auto sit = m_escLevelIdxBySlice.constBegin(); sit != m_escLevelIdxBySlice.constEnd(); ++sit) {
+                if (sit.value() == idx) {
+                    emit escLevelChanged(sit.key(), v);
+                    isSliceLevel = true;
+                    break;
+                }
+            }
+        }
         if (isSliceLevel) {
             // no-op, already emitted
         } else if (idx == m_fwdPwrIdx) {
@@ -115,8 +158,21 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
         } else if (idx == m_micPeakIdx) {
             m_micPeak = v;
             micChanged = true;
+        } else if (idx == m_afterEqIdx) {
+            // Smooth AFTEREQ to reduce async timing noise with COMPPEAK
+            constexpr float kEqAlpha = 0.3f;
+            m_afterEq = (m_afterEq < -140.0f) ? v : kEqAlpha * v + (1.0f - kEqAlpha) * m_afterEq;
         } else if (idx == m_compPeakIdx) {
-            m_compPeak = v;
+            // Smooth COMPPEAK similarly
+            constexpr float kCompAlpha = 0.3f;
+            float smoothed = (m_compPeakRaw < -140.0f) ? v : kCompAlpha * v + (1.0f - kCompAlpha) * m_compPeakRaw;
+            m_compPeakRaw = smoothed;
+            // Gain reduction = input - output (both smoothed)
+            // Only meaningful when both have signal
+            if (m_afterEq > -140.0f && smoothed > -140.0f)
+                m_compPeak = m_afterEq - smoothed;
+            else
+                m_compPeak = 0.0f;
             micChanged = true;
         } else if (idx == m_micLevelIdx) {
             m_micLevel = v;
@@ -133,6 +189,23 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
         } else if (idx == m_supplyIdx) {
             m_supplyVolts = v;  // "+13.8A" = supply voltage at point A (before fuse)
             hwChanged = true;
+        } else if (idx == m_tgxlFwdIdx) {
+            m_tgxlFwdPwr = std::pow(10.0f, v / 10.0f) / 1000.0f;
+            tgxlChanged = true;
+        } else if (idx == m_tgxlSwrIdx) {
+            float rho = std::pow(10.0f, -v / 20.0f);
+            m_tgxlSwr = (rho < 0.999f) ? (1.0f + rho) / (1.0f - rho) : 99.9f;
+            tgxlChanged = true;
+        } else if (idx == m_ampFwdPwrIdx) {
+            m_ampFwdPwr = std::pow(10.0f, v / 10.0f) / 1000.0f;  // dBm → watts
+            ampChanged = true;
+        } else if (idx == m_ampSwrIdx) {
+            float rho = std::pow(10.0f, -v / 20.0f);
+            m_ampSwr = (rho < 0.999f) ? (1.0f + rho) / (1.0f - rho) : 99.9f;
+            ampChanged = true;
+        } else if (idx == m_ampTempIdx) {
+            m_ampTemp = v;
+            ampChanged = true;
         }
 
         emit meterUpdated(idx, v);
@@ -147,6 +220,10 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
         emit this->alcChanged(m_alc);
     if (hwChanged)
         emit hwTelemetryChanged(m_paTemp, m_supplyVolts);
+    if (ampChanged)
+        emit ampMetersChanged(m_ampFwdPwr, m_ampSwr, m_ampTemp);
+    if (tgxlChanged)
+        emit tgxlMetersChanged(m_tgxlFwdPwr, m_tgxlSwr);
 }
 
 const MeterDef* MeterModel::meterDef(int index) const

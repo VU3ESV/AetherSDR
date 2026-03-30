@@ -65,6 +65,48 @@ void CwDecoder::stop()
     qCDebug(lcDsp) << "CwDecoder: stopped";
 }
 
+void CwDecoder::lockPitch(bool lock)
+{
+    m_pitchLocked = lock;
+    if (!m_ggmorse) return;
+    GGMorse::ParametersDecode dp = GGMorse::getDefaultParametersDecode();
+    dp.frequency_hz = lock ? m_pitch.load() : -1.0f;
+    dp.speed_wpm = m_speedLocked ? m_speed.load() : -1.0f;
+    dp.frequencyRangeMin_hz = m_pitchRangeMin;
+    dp.frequencyRangeMax_hz = m_pitchRangeMax;
+    m_ggmorse->setParametersDecode(dp);
+    qCDebug(lcDsp) << "CwDecoder: pitch" << (lock ? "locked at" : "unlocked from")
+                   << m_pitch.load() << "Hz";
+}
+
+void CwDecoder::lockSpeed(bool lock)
+{
+    m_speedLocked = lock;
+    if (!m_ggmorse) return;
+    GGMorse::ParametersDecode dp = GGMorse::getDefaultParametersDecode();
+    dp.frequency_hz = m_pitchLocked ? m_pitch.load() : -1.0f;
+    dp.speed_wpm = lock ? m_speed.load() : -1.0f;
+    dp.frequencyRangeMin_hz = m_pitchRangeMin;
+    dp.frequencyRangeMax_hz = m_pitchRangeMax;
+    m_ggmorse->setParametersDecode(dp);
+    qCDebug(lcDsp) << "CwDecoder: speed" << (lock ? "locked at" : "unlocked from")
+                   << m_speed.load() << "WPM";
+}
+
+void CwDecoder::setPitchRange(int minHz, int maxHz)
+{
+    m_pitchRangeMin = static_cast<float>(minHz);
+    m_pitchRangeMax = static_cast<float>(maxHz);
+    if (!m_ggmorse) return;
+    GGMorse::ParametersDecode dp = GGMorse::getDefaultParametersDecode();
+    dp.frequency_hz = m_pitchLocked ? m_pitch.load() : -1.0f;
+    dp.speed_wpm = m_speedLocked ? m_speed.load() : -1.0f;
+    dp.frequencyRangeMin_hz = m_pitchRangeMin;
+    dp.frequencyRangeMax_hz = m_pitchRangeMax;
+    m_ggmorse->setParametersDecode(dp);
+    qCDebug(lcDsp) << "CwDecoder: pitch range" << minHz << "-" << maxHz << "Hz";
+}
+
 void CwDecoder::feedAudio(const QByteArray& pcm24kStereo)
 {
     if (!m_running) return;

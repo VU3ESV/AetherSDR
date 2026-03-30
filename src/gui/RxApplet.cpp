@@ -88,23 +88,6 @@ namespace AetherSDR {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// Gradient title bar that heads each applet section (matches SmartSDR style).
-static QWidget* appletTitleBar(const QString& text)
-{
-    auto* bar = new QWidget;
-    bar->setFixedHeight(16);
-    bar->setStyleSheet(
-        "QWidget { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-        "stop:0 #3a4a5a, stop:0.5 #2a3a4a, stop:1 #1a2a38); "
-        "border-bottom: 1px solid #0a1a28; }");
-
-    auto* lbl = new QLabel(text, bar);
-    lbl->setStyleSheet("QLabel { background: transparent; color: #8aa8c0; "
-                       "font-size: 10px; font-weight: bold; }");
-    lbl->setGeometry(6, 1, 200, 14);
-    return bar;
-}
-
 // ── Style constants (matching STYLEGUIDE.md) ────────────────────────────────
 
 static constexpr const char* kButtonBase =
@@ -243,7 +226,6 @@ void RxApplet::buildUI()
     auto* outer = new QVBoxLayout(this);
     outer->setContentsMargins(0, 0, 0, 0);
     outer->setSpacing(0);
-    outer->addWidget(appletTitleBar("RX"));
 
     auto* inner = new QWidget;
     auto* root = new QVBoxLayout(inner);
@@ -1081,6 +1063,27 @@ void RxApplet::setNrState(int state)
     }
 }
 
+void RxApplet::setRnnState(int state)
+{
+    static const QString kOn =
+        "QPushButton { background: #1a6030; color: #ffffff;"
+        " border: 1px solid #20a040; border-radius: 2px;"
+        " font-size: 10px; font-weight: bold; padding: 1px 4px; }";
+    static const QString kOff = QString(kButtonBase) + kGreenActive;
+
+    m_rnnState = state;
+    if (state == 0) {
+        m_rnnBtn->setText("RNN");
+        m_rnnBtn->setStyleSheet(kOff);
+    } else if (state == 1) {
+        m_rnnBtn->setText("RNN");
+        m_rnnBtn->setStyleSheet(kOn);
+    } else {
+        m_rnnBtn->setText("RN2");
+        m_rnnBtn->setStyleSheet(kOn);
+    }
+}
+
 void RxApplet::setAfGain(int pct)
 {
     QSignalBlocker b(m_afSlider);
@@ -1447,6 +1450,10 @@ void RxApplet::connectSlice(SliceModel* s)
         QSignalBlocker b(m_revBtn);
         m_revBtn->setChecked(false);  // REV state not persisted by radio
     }
+
+    // Step size — sync from radio's per-slice step and step_list
+    syncStepFromSlice(s->stepHz(), s->stepList());
+    connect(s, &SliceModel::stepChanged, this, &RxApplet::syncStepFromSlice);
 }
 
 void RxApplet::disconnectSlice(SliceModel* s)
@@ -1568,21 +1575,8 @@ void RxApplet::updateModeSettings(const QString& mode)
         m_sqlBtn->setChecked(true);
     }
 
-    // Update step sizes, keeping closest step to previous value
-    const int prevStep = (m_stepIdx >= 0 && m_stepIdx < m_stepSizes.size())
-                             ? m_stepSizes[m_stepIdx] : 100;
-    m_stepSizes = settings.stepSizes;
-    rebuildStepSizes();
-
-    // Find closest step size to what was previously selected
-    m_stepIdx = 0;
-    int bestDist = std::abs(m_stepSizes[0] - prevStep);
-    for (int i = 1; i < m_stepSizes.size(); ++i) {
-        int dist = std::abs(m_stepSizes[i] - prevStep);
-        if (dist < bestDist) { bestDist = dist; m_stepIdx = i; }
-    }
-    m_stepLabel->setText(formatStepLabel(m_stepSizes[m_stepIdx]));
-    emit stepSizeChanged(m_stepSizes[m_stepIdx]);
+    // Step sizes are radio-authoritative — driven by SliceModel::stepChanged
+    // signal connected in connectSlice(). No client-side step update here.
 
     // Refresh filter highlight for current slice filter
     if (m_slice) updateFilterButtons();
@@ -1613,6 +1607,55 @@ void RxApplet::rebuildStepSizes()
     if (m_stepIdx >= m_stepSizes.size())
         m_stepIdx = m_stepSizes.size() - 1;
     if (m_stepIdx < 0) m_stepIdx = 0;
+}
+
+void RxApplet::cycleStepUp()
+{
+    if (m_stepIdx < m_stepSizes.size() - 1) {
+        m_stepIdx++;
+        m_stepLabel->setText(formatStepLabel(m_stepSizes[m_stepIdx]));
+        emit stepSizeChanged(m_stepSizes[m_stepIdx]);
+    }
+}
+
+void RxApplet::cycleStepDown()
+{
+    if (m_stepIdx > 0) {
+        m_stepIdx--;
+        m_stepLabel->setText(formatStepLabel(m_stepSizes[m_stepIdx]));
+        emit stepSizeChanged(m_stepSizes[m_stepIdx]);
+    }
+}
+
+void RxApplet::setInitialStepSize(int hz)
+{
+    if (m_stepSizes.isEmpty()) return;
+    int bestIdx = 0;
+    int bestDist = std::abs(m_stepSizes[0] - hz);
+    for (int i = 1; i < m_stepSizes.size(); ++i) {
+        int dist = std::abs(m_stepSizes[i] - hz);
+        if (dist < bestDist) { bestDist = dist; bestIdx = i; }
+    }
+    m_stepIdx = bestIdx;
+    m_stepLabel->setText(formatStepLabel(m_stepSizes[m_stepIdx]));
+}
+
+void RxApplet::syncStepFromSlice(int stepHz, const QVector<int>& stepList)
+{
+    // Update step list if the radio sent one (mode-specific)
+    if (!stepList.isEmpty() && stepList != m_stepSizes) {
+        m_stepSizes = stepList;
+    }
+    // Find closest matching step index
+    if (m_stepSizes.isEmpty()) return;
+    int bestIdx = 0;
+    int bestDist = std::abs(m_stepSizes[0] - stepHz);
+    for (int i = 1; i < m_stepSizes.size(); ++i) {
+        int dist = std::abs(m_stepSizes[i] - stepHz);
+        if (dist < bestDist) { bestDist = dist; bestIdx = i; }
+    }
+    m_stepIdx = bestIdx;
+    m_stepLabel->setText(formatStepLabel(m_stepSizes[m_stepIdx]));
 }
 
 void RxApplet::updateAgcCombo()
