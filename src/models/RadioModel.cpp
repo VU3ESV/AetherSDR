@@ -57,7 +57,7 @@ RadioModel::RadioModel(QObject* parent)
         }
 
         // Intercept TUNE start: inhibit ACC TX first to protect amplifier
-        if (cmd == "transmit tune 1"
+        if (cmd == "transmit tune 1"            
             && AppSettings::instance().value("TuneInhibitAmp", "False").toString() == "True") {
             // Find TX slice frequency
             double txFreq = 0.0;
@@ -67,13 +67,24 @@ RadioModel::RadioModel(QObject* parent)
             int bandId = bandIdForFrequency(txFreq);
             if (bandId >= 0) {
                 auto it = m_txBandSettings.find(bandId);
-                if (it != m_txBandSettings.end() && it->accTx) {
-                    m_tuneInhibitBandId = bandId;
-                    m_tuneInhibitActive = true;
-                    sendCmd(QString("interlock bandset %1 acc_tx_enabled=0").arg(bandId));
-                    qDebug() << "Tune PA inhibit: disabled ACC TX on band" << bandId
-                             << "before tune";
-                }
+                if (it != m_txBandSettings.end()) {
+                    // Collect enabled TX paths once
+                    QStringList txPaths;
+                    if (it->accTx) txPaths << "acc_tx_enabled";
+                    if (it->tx1)   txPaths << "tx1_enabled";
+                    if (it->tx2)   txPaths << "tx2_enabled";
+                    
+                    // Send all inhibit commands in batch
+                    for (const auto& path : txPaths) {
+                        sendCmd(QString("interlock bandset %1 %2=0").arg(bandId).arg(path));
+                    }
+                    
+                    if (!txPaths.isEmpty()) {
+                        m_tuneInhibitBandId = bandId;
+                        m_tuneInhibitActive = true;
+                        qDebug() << "Tune PA inhibit: disabled" << txPaths.join(", ") << "on band" << bandId;
+                    }
+                }        
             }
         }
         sendCmd(cmd);
@@ -101,8 +112,11 @@ RadioModel::RadioModel(QObject* parent)
     // ── Tune PA inhibit: restore ACC TX when tune completes ──
     connect(&m_transmitModel, &TransmitModel::tuneChanged, this, [this](bool tuning) {
         if (!tuning && m_tuneInhibitActive && m_tuneInhibitBandId >= 0) {
-            sendCmd(QString("interlock bandset %1 acc_tx_enabled=1").arg(m_tuneInhibitBandId));
-            qDebug() << "Tune PA inhibit: restored ACC TX on band" << m_tuneInhibitBandId;
+            const QStringList txPaths = {"acc_tx_enabled", "tx1_enabled", "tx2_enabled"};
+            for (const auto& path : txPaths) {
+                sendCmd(QString("interlock bandset %1 %2=1").arg(m_tuneInhibitBandId).arg(path));
+            }
+            qDebug() << "Tune PA inhibit: restored TX paths on band" << m_tuneInhibitBandId;
             m_tuneInhibitActive = false;
             m_tuneInhibitBandId = -1;
         }
